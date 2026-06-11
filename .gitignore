@@ -1,0 +1,14 @@
+# Never commit credentials
+.env
+*.key
+keys.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

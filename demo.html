@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Insightly MCP — visual demo</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --line:#30363d; --txt:#e6edf3; --dim:#8b949e;
+    --green:#3fb950; --blue:#58a6ff; --orange:#d29922; --purple:#bc8cff; --red:#f85149;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:linear-gradient(160deg,#0a0d12,#10161f 60%,#0a0d12);
+       font-family:-apple-system,"Segoe UI",Roboto,Helvetica,sans-serif;color:var(--txt);
+       min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:32px 16px}
+  h1{font-size:1.5rem;margin:0 0 4px}
+  .sub{color:var(--dim);margin:0 0 22px;font-size:.95rem;text-align:center}
+  .term{width:min(860px,100%);background:var(--panel);border:1px solid var(--line);
+        border-radius:12px;box-shadow:0 18px 60px rgba(0,0,0,.5);overflow:hidden}
+  .bar{display:flex;align-items:center;gap:8px;padding:10px 14px;background:#1c2129;border-bottom:1px solid var(--line)}
+  .dot{width:12px;height:12px;border-radius:50%}
+  .bar span{margin-left:8px;color:var(--dim);font-size:.8rem}
+  .scene-label{margin-left:auto;color:var(--blue);font-size:.78rem;font-weight:600}
+  #screen{font-family:"SF Mono",Menlo,Consolas,monospace;font-size:.86rem;line-height:1.65;
+          padding:18px 20px;min-height:430px;white-space:pre-wrap;word-break:break-word}
+  .p{color:var(--green)} .cmd{color:var(--txt)} .dim{color:var(--dim)} .ok{color:var(--green)}
+  .you{color:var(--orange);font-weight:700} .claude{color:var(--purple);font-weight:700}
+  .tool{color:var(--blue)} .warn{color:var(--red)}
+  .cursor{display:inline-block;width:8px;height:15px;background:var(--txt);vertical-align:-2px;animation:bl .9s steps(1) infinite}
+  @keyframes bl{50%{opacity:0}}
+  /* elicitation dialog */
+  #dlg{position:absolute;inset:0;display:none;align-items:center;justify-content:center;background:rgba(5,8,12,.6);backdrop-filter:blur(2px)}
+  .card{background:#1c2129;border:1px solid var(--line);border-radius:12px;padding:20px 22px;width:min(420px,90%);box-shadow:0 12px 50px rgba(0,0,0,.6)}
+  .card h3{margin:0 0 4px;font-size:1rem}.card p{margin:0 0 14px;color:var(--dim);font-size:.83rem}
+  .f{margin-bottom:11px}.f label{display:block;font-size:.72rem;color:var(--dim);margin-bottom:4px;text-transform:uppercase;letter-spacing:.04em}
+  .f .v{background:#0d1117;border:1px solid var(--line);border-radius:7px;padding:8px 10px;font-family:Menlo,monospace;font-size:.84rem;min-height:35px}
+  .chk{display:flex;align-items:center;gap:8px;font-size:.86rem;margin:4px 0 16px}
+  .box{width:16px;height:16px;border:1.5px solid var(--dim);border-radius:4px;display:grid;place-items:center;color:var(--green);font-weight:700}
+  .btns{display:flex;justify-content:flex-end;gap:10px}
+  .btn{padding:7px 16px;border-radius:7px;font-size:.85rem;border:1px solid var(--line);color:var(--dim)}
+  .btn.go{background:var(--blue);border-color:var(--blue);color:#0d1117;font-weight:700}
+  .wrap{position:relative;width:min(860px,100%)}
+  .controls{margin-top:14px;display:flex;gap:10px;align-items:center}
+  .controls button{background:var(--panel);color:var(--txt);border:1px solid var(--line);border-radius:8px;padding:7px 16px;cursor:pointer;font-size:.85rem}
+  .controls button:hover{border-color:var(--blue)}
+  .step{color:var(--dim);font-size:.8rem}
+</style>
+</head>
+<body>
+<h1>🔌 Insightly MCP — what it looks like</h1>
+<p class="sub">Spin-up → ask Claude → key prompt (no config files) → real CRM results. Plays automatically.</p>
+
+<div class="wrap">
+  <div class="term">
+    <div class="bar">
+      <div class="dot" style="background:#ff5f57"></div><div class="dot" style="background:#febc2e"></div><div class="dot" style="background:#28c840"></div>
+      <span>terminal — claude code</span><span class="scene-label" id="lbl"></span>
+    </div>
+    <div id="screen"></div>
+  </div>
+  <div id="dlg"><div class="card">
+    <h3>🔑 Connect to Insightly</h3>
+    <p>The MCP server is asking for input <em>(your reply goes to the server — never into the chat)</em></p>
+    <div class="f"><label>api_key</label><div class="v" id="d-key"></div></div>
+    <div class="f"><label>pod</label><div class="v">na1</div></div>
+    <div class="f"><label>friendly_name</label><div class="v" id="d-name"></div></div>
+    <div class="chk"><div class="box" id="d-save"></div> Save this key for next time</div>
+    <div class="btns"><div class="btn">Cancel</div><div class="btn go">Submit</div></div>
+  </div></div>
+</div>
+
+<div class="controls">
+  <button onclick="restart()">⟲ Replay</button>
+  <span class="step" id="prog"></span>
+</div>
+
+<script>
+const S = document.getElementById('screen'), DLG = document.getElementById('dlg'),
+      LBL = document.getElementById('lbl'), PROG = document.getElementById('prog');
+let timer = [], i = 0;
+
+// script: [type, payload, delayAfter]
+const SCRIPT = [
+  ['label','① Install (once, ~30 seconds)'],
+  ['line','<span class="p">$</span> <span class="cmd">git clone github.com/lukeswade/insightly-mcp ~/insightly-mcp</span>',500],
+  ['line','<span class="dim">Cloning… done.</span>',350],
+  ['line','<span class="p">$</span> <span class="cmd">claude mcp add --scope user insightly -- uv run --with mcp --with httpx --with pydantic python ~/insightly-mcp/insightly_mcp.py</span>',650],
+  ['line','<span class="ok">✓ Added MCP server "insightly" (user scope)</span>',900],
+  ['line','',150],
+  ['label','② Just ask Claude'],
+  ['line','<span class="you">you ›</span> find the Insightly contact with email jane@acme.com and add a note that we spoke today',900],
+  ['line','',120],
+  ['line','<span class="claude">claude ›</span> <span class="dim">I\'ll search Insightly for that contact.</span>',500],
+  ['line','  <span class="tool">⚒ insightly · search_records(object: "Contacts", field_name: "EMAIL_ADDRESS", …)</span>',700],
+  ['label','③ First use → it prompts for a key (no config files)'],
+  ['dialog-open',null,400],
+  ['dialog-type','d-key','••••••••-f00e-48d5-bbb9-••••••••',900],
+  ['dialog-type','d-name','acme-demo',600],
+  ['dialog-check','d-save','✓',700],
+  ['dialog-close',null,350],
+  ['line','  <span class="ok">✓ connected as "acme-demo" (na1) — key saved for next time</span>',650],
+  ['label','④ Real CRM results'],
+  ['line','  <span class="tool">⚒ search_records → 1 match</span>',420],
+  ['line','  <span class="dim">{ CONTACT_ID: 369025655, FIRST_NAME: "Jane", LAST_NAME: "Doe", … }</span>',520],
+  ['line','  <span class="tool">⚒ insightly · add_note(parent: Contacts/369025655, title: "Call summary")</span>',650],
+  ['line','  <span class="ok">✓ note created</span>',420],
+  ['line','',120],
+  ['line','<span class="claude">claude ›</span> Found <b>Jane Doe</b> (contact #369025655) and added the note <i>“Call summary — we spoke today.”</i>',1500],
+  ['line','',150],
+  ['label','⑤ Switching demo environments = just reconnect'],
+  ['line','<span class="you">you ›</span> connect to a different env',700],
+  ['line','<span class="claude">claude ›</span> <span class="tool">⚒ insightly · connect()</span> <span class="dim">→ prompts again: pick "acme-demo" / "globex-demo" / enter a new key…</span>',1600],
+  ['line','',120],
+  ['line','<span class="dim">That\'s it — full read/write on any object: contacts, orgs, leads, opportunities, projects, tasks, notes, custom objects… Deletes always require an explicit confirm.</span>',2600],
+];
+
+function playStep(){
+  if(i >= SCRIPT.length){ PROG.textContent='done — replays in 4s'; timer.push(setTimeout(restart,4000)); return; }
+  const step = SCRIPT[i]; i++;
+  PROG.textContent = 'step ' + i + ' / ' + SCRIPT.length;
+  const kind = step[0];
+  if(kind === 'label'){ LBL.textContent = step[1]; playStep(); return; }
+  let delay = 300;
+  if(kind === 'line'){
+    const div = document.createElement('div'); div.innerHTML = step[1] || '&nbsp;';
+    S.appendChild(div); S.scrollTop = S.scrollHeight; delay = step[2] || 300;
+  } else if(kind === 'dialog-open'){ DLG.style.display='flex'; delay = step[2] || 300;
+  } else if(kind === 'dialog-close'){ DLG.style.display='none'; delay = step[2] || 300;
+  } else if(kind === 'dialog-check'){ document.getElementById(step[1]).textContent='✓'; delay = step[2] || 300;
+  } else if(kind === 'dialog-type'){
+    const el = document.getElementById(step[1]), txt = step[2]; el.textContent='';
+    let c = 0;
+    const t = setInterval(()=>{ el.textContent = txt.slice(0, ++c); if(c >= txt.length) clearInterval(t); }, 22);
+    timer.push(t); delay = step[3] || (txt.length * 22 + 250);
+  }
+  timer.push(setTimeout(playStep, delay));
+}
+
+function restart(){
+  timer.forEach(t=>{clearTimeout(t);clearInterval(t)}); timer=[]; i=0;
+  S.innerHTML=''; DLG.style.display='none';
+  document.getElementById('d-key').textContent=''; document.getElementById('d-name').textContent='';
+  document.getElementById('d-save').textContent='';
+  playStep();
+}
+restart();
+</script>
+</body>
+</html>
