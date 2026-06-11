@@ -31,7 +31,7 @@ them conversationally drivable in seconds:
 - **Cleanup** — "find and delete the TEST contacts."
 - **Cross-object work** — "add a follow-up task on every open opportunity."
 - **No env juggling** — switching environments is just re-connecting with a
-  different API key. No config files to edit.
+  different API key. No config files to edit in Claude Code.
 
 ## How it works (60 seconds)
 
@@ -91,7 +91,7 @@ Projects, Tasks, Events, Notes, Products, custom objects, and more.
 
 | Requirement | Notes |
 |---|---|
-| **Claude Code** (recent version) | The interactive key prompt uses MCP "elicitation" |
+| **Claude Code** or the **Claude desktop app** | Claude Code's interactive key prompt uses MCP "elicitation"; the desktop app uses a one-time config file (see [ONBOARDING.md](ONBOARDING.md)) |
 | **Python 3.10+** and **uv** | `brew install uv` — runs the server with zero setup |
 | **An Insightly API key** | Insightly → User Settings → API (any demo env) |
 | Hosting / servers | **None.** It runs locally on your laptop, launched by Claude on demand |
@@ -107,7 +107,8 @@ claude mcp add --scope user insightly \
 ```
 
 Restart Claude Code, then ask: *"List my Insightly contacts."* It will prompt for
-your key, and you're off.
+your key, and you're off. (Claude desktop app setup — and why claude.ai in the
+browser can't run this — is covered in [ONBOARDING.md](ONBOARDING.md).)
 
 And open **[demo.html](demo.html)** in a browser for a visual walkthrough of what
 spin-up and usage look like.
