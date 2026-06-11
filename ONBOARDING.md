@@ -97,6 +97,7 @@ Things to try next:
 |---|---|
 | "No such tool" / Claude doesn't see it | Restart Claude Code; check `claude mcp list` |
 | Desktop app doesn't see it | Fully quit (**Cmd+Q**) and reopen — closing the window isn't enough. Check the tools menu in the chat input |
+| Claude answers from the wrong Insightly instance (test/sandbox data) | Claude is probably using a company-level hosted Insightly *connector* instead of this local server (the browser version of claude.ai can **only** see those). Ask Claude *"which Insightly tools can you see?"* — you want one named `insightly`. Toggle other Insightly connectors off in the chat's tools menu, and verify with *"run connection_info"* (reports the org/pod you're connected to) |
 | No key prompt appears | Your client may not support elicitation — update Claude Code, use the desktop app's `env` block, or say *"use set_api_key"* (key passes through chat — demo envs only) |
 | `unauthorized (401)` | Wrong key or wrong pod (e.g. `eu1` org with `na1` pod). Re-run `connect` |
 | `rate limited (429)` | Insightly caps ~10 req/sec + daily quota per plan; the server retries automatically — just slow down bulk asks |
