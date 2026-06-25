@@ -36,10 +36,27 @@ Restart Claude Code (or start a new session).
 
 ### Claude desktop app (chat)
 
-Do step 1 above (the clone), then add this to
-`~/Library/Application Support/Claude/claude_desktop_config.json` — create the
-`mcpServers` key if the file doesn't have one, and use **absolute paths** (`~`
-doesn't expand here):
+Do step 1 above (the clone). The config goes in
+`~/Library/Application Support/Claude/claude_desktop_config.json`, and it needs
+**absolute paths** — `~` and `$HOME` are *not* expanded here, and the `uv` path
+differs on Intel vs. Apple Silicon Macs.
+
+Don't hand-type the paths — let the terminal fill them in. Paste this into
+**Terminal** and it prints a ready-to-use block with *your* real values:
+
+```bash
+cat <<EOF
+"insightly": {
+  "command": "$(which uv)",
+  "args": ["run", "--with", "mcp", "--with", "httpx", "--with", "pydantic", "python", "$HOME/insightly-mcp/insightly_mcp.py"],
+  "env": { "INSIGHTLY_API_KEY": "PASTE-YOUR-KEY-HERE", "INSIGHTLY_POD": "na1" }
+}
+EOF
+```
+
+Then in Claude: **Settings → Developer → Edit Config**, paste that block inside a
+top-level `"mcpServers": { … }` object (create it if it isn't there), and replace
+`PASTE-YOUR-KEY-HERE` with your API key. The finished file looks like:
 
 ```json
 {
@@ -47,12 +64,18 @@ doesn't expand here):
     "insightly": {
       "command": "/opt/homebrew/bin/uv",
       "args": ["run", "--with", "mcp", "--with", "httpx", "--with", "pydantic",
-               "python", "/Users/<you>/insightly-mcp/insightly_mcp.py"],
-      "env": { "INSIGHTLY_API_KEY": "<your-key>", "INSIGHTLY_POD": "na1" }
+               "python", "/Users/jane/insightly-mcp/insightly_mcp.py"],
+      "env": { "INSIGHTLY_API_KEY": "your-real-key", "INSIGHTLY_POD": "na1" }
     }
   }
 }
 ```
+
+> ⚠️ **No angle brackets in the final file.** `/Users/jane/…` above is an
+> *example* — the generator command fills in your actual username. If you copy
+> the template by hand, replace the **whole** `/Users/jane` (and `your-real-key`)
+> with real values — a path like `/Users/<jane>/…` with literal `<` `>` points at
+> a folder that doesn't exist and the server will show **"Server disconnected."**
 
 Fully quit (**Cmd+Q**) and reopen Claude. The `env` block skips the interactive
 key prompt — recommended here, since the desktop chat may not support
@@ -97,6 +120,8 @@ Things to try next:
 |---|---|
 | "No such tool" / Claude doesn't see it | Restart Claude Code; check `claude mcp list` |
 | Desktop app doesn't see it | Fully quit (**Cmd+Q**) and reopen — closing the window isn't enough. Check the tools menu in the chat input |
+| Desktop app shows `insightly` as **failed** / "Server disconnected" | Open **Settings → Developer** and read the **Arguments** path. If it contains angle brackets like `/Users/<name>/…`, that's the bug — those `< >` are placeholders, delete them (real home dirs have none). Easiest fix: re-run the generator command above and paste fresh values. Confirm the file exists first: `ls "$HOME/insightly-mcp/insightly_mcp.py"`. Then **Cmd+Q** and reopen |
+| "Authorization with the MCP server failed" / `ofid_…` / "ins test … connection expired" | **Not your local server.** That's a separate company-hosted Insightly *connector* under Settings → Connectors whose login expired. It's unrelated to your `insightly` setup — ignore it, or click into it and disconnect so the error stops popping up |
 | Claude answers from the wrong Insightly instance (test/sandbox data) | Claude is probably using a company-level hosted Insightly *connector* instead of this local server (the browser version of claude.ai can **only** see those). Ask Claude *"which Insightly tools can you see?"* — you want one named `insightly`. Toggle other Insightly connectors off in the chat's tools menu, and verify with *"run connection_info"* (reports the org/pod you're connected to) |
 | No key prompt appears | Your client may not support elicitation — update Claude Code, use the desktop app's `env` block, or say *"use set_api_key"* (key passes through chat — demo envs only) |
 | `unauthorized (401)` | Wrong key or wrong pod (e.g. `eu1` org with `na1` pod). Re-run `connect` |
