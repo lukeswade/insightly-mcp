@@ -41,7 +41,7 @@ PK = {
     "Opportunities": "OPPORTUNITY_ID", "Projects": "PROJECT_ID", "Tasks": "TASK_ID",
     "Events": "EVENT_ID", "Notes": "NOTE_ID", "Products": "PRODUCT_ID",
     "Emails": "EMAIL_ID", "Quotations": "QUOTATION_ID", "Milestones": "MILESTONE_ID",
-    "Pricebooks": "PRICEBOOK_ID", "Tickets": "TICKET_ID", "Knowledge": "KNOWLEDGE_ARTICLE_ID",
+    "Pricebooks": "PRICEBOOK_ID", "Tickets": "TICKET_ID", "KnowledgeArticle": "ARTICLE_ID",
 }
 COMMON_OBJECTS = sorted(PK.keys()) + [
     "Pipelines", "PipelineStages", "Relationships", "Tags", "Categories",
@@ -142,6 +142,20 @@ def _safe(resp: Optional[httpx.Response]) -> Any:
 def _obj(name: str) -> str:
     n = (name or "").strip().strip("/")
     return "Organisations" if n.lower() in ("organizations", "organization") else n
+
+# Heavy fields Insightly's own `brief` mode fails to strip — full HTML/long free text
+# that bloats list results (e.g. a KnowledgeArticle Body can be tens of KB). We drop
+# them client-side when brief is requested.
+_BRIEF_DROP = ("Body",)
+
+def _brief_strip(data: Any) -> Any:
+    """Drop heavy fields from each record in a brief list result; pass other shapes through."""
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                for k in _BRIEF_DROP:
+                    item.pop(k, None)
+    return data
 
 async def _request(method: str, path: str, params: Optional[dict] = None, json_body: Any = None) -> Any:
     method = method.upper()
@@ -247,7 +261,8 @@ async def list_records(object: str, ctx: Context, top: int = 20, skip: int = 0, 
         params["order_by"] = order_by
     if updated_after_utc:
         params["updated_after_utc"] = updated_after_utc
-    return await _request("GET", f"/{_obj(object)}", params=params)
+    result = await _request("GET", f"/{_obj(object)}", params=params)
+    return _brief_strip(result) if brief else result
 
 @mcp.tool()
 async def search_records(object: str, field_name: str, field_value: str, ctx: Context,
