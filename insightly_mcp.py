@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Insightly CRM MCP server — interactive auth, full read/write.
+Insightly SE MCP (internal) — Insightly CRM, full read/write.
 
 On first use the server PROMPTS you for an Insightly API key (MCP elicitation) —
 no env vars or config files to hand-edit. You may optionally save the key under a
@@ -8,9 +8,12 @@ friendly name so you can reuse it next time; saving is handled by the server, ne
 a manual file edit. If your orchestration injects INSIGHTLY_API_KEY in the env, that
 is used automatically and you won't be prompted.
 
-Generic backbone otherwise: full CRUD on every object + a raw_request escape hatch,
-429 backoff. Keys live in process memory for the session (and, only if you choose to
-save, in ~/.insightly-mcp/keys.json, chmod 600) — never passed as tool arguments.
+Generic backbone otherwise: full CRUD on every object + a raw_request escape hatch.
+Built for record-heavy demo envs: a pooled HTTP connection, client-side rate pacing
+(the API allows 10 req/s), paginated list results with a has_more/next_skip envelope,
+an opt-in fetch_all, brief-by-default listing, and a client-side contains filter.
+Keys live in process memory for the session (and, only if you choose to save, in
+~/.insightly-mcp/keys.json, chmod 600) — never passed as tool arguments.
 
 Optional env vars:
   INSIGHTLY_API_KEY    pre-inject a key (skips the prompt)
@@ -20,6 +23,7 @@ Optional env vars:
 """
 import os
 import json
+import time
 import asyncio
 import pathlib
 from typing import Any, Optional
@@ -28,10 +32,18 @@ import httpx
 from pydantic import BaseModel, Field
 from mcp.server.fastmcp import Context, FastMCP
 
+SERVER_VERSION = "2.0.0"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
-mcp = FastMCP("insightly")
+# Insightly limits: max 500 records/request; 10 requests/second (all plans).
+PAGE_MAX = 500
+FETCH_ALL_HARD_CAP = 5000
+_MIN_INTERVAL = 0.12  # ~8.3 req/s ceiling, comfortably under the API's 10/s
+
+# Display name shown in Claude's UI. The registration key stays `insightly`
+# (mcpServers key / `claude mcp add insightly`), so tool names are unchanged.
+mcp = FastMCP("Insightly SE MCP (internal)")
 
 # Live credentials for THIS connection (in memory only).
 SESSION: dict = {"api_key": None, "pod": "na1", "name": None}
@@ -157,35 +169,134 @@ def _brief_strip(data: Any) -> Any:
                     item.pop(k, None)
     return data
 
-async def _request(method: str, path: str, params: Optional[dict] = None, json_body: Any = None) -> Any:
-    method = method.upper()
+def _apply_sort(items: Any, order_by: Optional[str]) -> Any:
+    """CLIENT-SIDE sort of already-fetched records (the API has no sort param).
+    order_by like 'DATE_UPDATED_UTC desc'. Records missing the field sort last."""
+    if not order_by or not isinstance(items, list):
+        return items
+    parts = str(order_by).split()
+    field = parts[0]
+    desc = len(parts) > 1 and parts[1].lower().startswith("desc")
+    present = [r for r in items if isinstance(r, dict) and r.get(field) is not None]
+    missing = [r for r in items if not (isinstance(r, dict) and r.get(field) is not None)]
+    try:
+        present.sort(key=lambda r: r.get(field), reverse=desc)
+    except TypeError:
+        present.sort(key=lambda r: str(r.get(field)), reverse=desc)
+    return present + missing
+
+def _page_envelope(items: list, skip: int, top: int) -> dict:
+    """Wrap a page of records so the model can tell there's more and where to resume."""
+    returned = len(items) if isinstance(items, list) else 0
+    return {"items": items, "returned": returned, "skip": skip, "top": top,
+            "has_more": returned == top, "next_skip": skip + returned}
+
+
+# One pooled client per (pod, key) so we reuse the TLS/keep-alive connection across
+# calls instead of paying a fresh handshake every request (the old behaviour).
+_CLIENT: Optional[httpx.AsyncClient] = None
+_CLIENT_ID: tuple = (None, None)
+
+async def _client() -> httpx.AsyncClient:
+    global _CLIENT, _CLIENT_ID
     key = SESSION.get("api_key")
     pod = SESSION.get("pod") or "na1"
-    if not key:
-        return {"error": "not connected — run connect() (you'll be prompted) or set_api_key(...)."}
-    if READONLY and method != "GET":
-        return {"error": "read-only mode is on (INSIGHTLY_READONLY); writes are disabled."}
-    base = f"https://api.{pod}.insightly.com/v3.1"
-    last: Optional[httpx.Response] = None
-    async with httpx.AsyncClient(base_url=base, auth=(key, ""), timeout=30.0,
-                                 headers={"Accept": "application/json"}) as c:
-        for attempt in range(4):
+    ident = (pod, key)
+    if _CLIENT is None or _CLIENT_ID != ident:
+        if _CLIENT is not None:
             try:
-                r = await c.request(method, path, params=params, json=json_body)
-            except Exception as e:
-                return {"error": f"request failed: {e}"}
-            if r.status_code == 429:
-                last = r
-                await asyncio.sleep(min(float(r.headers.get("Retry-After", 1.5)) * (attempt + 1), 12.0))
-                continue
-            if r.status_code == 401:
-                return {"error": "unauthorized (401) — the API key was rejected."}
-            if not r.is_success:
-                return {"error": f"HTTP {r.status_code}", "body": _safe(r)}
-            if r.status_code == 204 or not r.content:
-                return {"ok": True}
-            return r.json()
-    return {"error": "rate limited (429) after retries", "body": _safe(last)}
+                await _CLIENT.aclose()
+            except Exception:
+                pass
+        _CLIENT = httpx.AsyncClient(
+            base_url=f"https://api.{pod}.insightly.com/v3.1",
+            auth=(key or "", ""), timeout=30.0,
+            headers={"Accept": "application/json"},
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20))
+        _CLIENT_ID = ident
+    return _CLIENT
+
+# Simple client-side pacer so bulk paging never trips the API's 10 req/s limit.
+_RATE_LOCK = asyncio.Lock()
+_NEXT_OK = 0.0
+
+async def _pace() -> None:
+    global _NEXT_OK
+    async with _RATE_LOCK:
+        now = time.monotonic()
+        wait = _NEXT_OK - now
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _NEXT_OK = max(now, _NEXT_OK) + _MIN_INTERVAL
+
+
+async def _request(method: str, path: str, params: Optional[dict] = None,
+                   json_body: Any = None, want_headers: bool = False) -> Any:
+    """Perform one API call. Returns the parsed body, or (body, headers_lower) when
+    want_headers=True (headers keyed lowercase). On failure returns an {'error': ...} body."""
+    method = method.upper()
+    key = SESSION.get("api_key")
+
+    def wrap(body: Any, headers: Optional[dict] = None) -> Any:
+        return (body, headers or {}) if want_headers else body
+
+    if not key:
+        return wrap({"error": "not connected — run connect() (you'll be prompted) or set_api_key(...)."})
+    if READONLY and method != "GET":
+        return wrap({"error": "read-only mode is on (INSIGHTLY_READONLY); writes are disabled."})
+
+    client = await _client()
+    last: Optional[httpx.Response] = None
+    for attempt in range(4):
+        await _pace()
+        try:
+            r = await client.request(method, path, params=params, json=json_body)
+        except Exception as e:
+            return wrap({"error": f"request failed: {e}"})
+        hdr = {k.lower(): v for k, v in r.headers.items()}
+        if r.status_code == 429:
+            last = r
+            await asyncio.sleep(min(float(r.headers.get("Retry-After", 1.5)) * (attempt + 1), 12.0))
+            continue
+        if r.status_code == 401:
+            SESSION["api_key"] = None  # force a fresh connect; the key was rejected
+            return wrap({"error": "unauthorized (401) — the API key was rejected; "
+                                  "reconnect() or set_api_key(...) with a valid key/pod."}, hdr)
+        if not r.is_success:
+            return wrap({"error": f"HTTP {r.status_code}", "body": _safe(r)}, hdr)
+        if r.status_code == 204 or not r.content:
+            return wrap({"ok": True}, hdr)
+        return wrap(r.json(), hdr)
+    return wrap({"error": "rate limited (429) after retries — the API allows ~10 req/s; slow down bulk asks.",
+                 "body": _safe(last)}, {k.lower(): v for k, v in last.headers.items()} if last else {})
+
+
+async def _fetch_all(o: str, brief: bool = True, updated_after_utc: Optional[str] = None,
+                     max_records: int = 1000) -> dict:
+    """Page through an object up to max_records (hard cap FETCH_ALL_HARD_CAP), rate-paced."""
+    cap = min(max(int(max_records), 1), FETCH_ALL_HARD_CAP)
+    out: list = []
+    skip = 0
+    truncated = False
+    while len(out) < cap:
+        page = min(PAGE_MAX, cap - len(out))
+        params = {"top": page, "skip": skip, "brief": str(brief).lower()}
+        if updated_after_utc:
+            params["updated_after_utc"] = updated_after_utc
+        body = await _request("GET", f"/{o}", params=params)
+        if isinstance(body, dict) and body.get("error"):
+            return {"items": _brief_strip(out) if brief else out, "total_fetched": len(out),
+                    "truncated": True, "partial": True, "error": body["error"]}
+        batch = body if isinstance(body, list) else []
+        out.extend(batch)
+        if len(batch) < page:
+            break  # short page → reached the end
+        skip += len(batch)
+    else:
+        truncated = True  # exited on the cap; more may remain
+    if brief:
+        _brief_strip(out)
+    return {"items": out, "total_fetched": len(out), "truncated": truncated}
 
 
 # -------------------------------------------------------------------- session tools
@@ -213,9 +324,13 @@ def set_api_key(api_key: str, pod: str = "na1", friendly_name: str = "", save: b
 
 @mcp.tool()
 def connection_info() -> dict:
-    """Show whether this connection is authenticated and which org/pod it points at."""
-    return {"connected": bool(SESSION.get("api_key")), "as": SESSION.get("name"),
-            "pod": SESSION.get("pod"), "read_only": READONLY}
+    """Show whether this connection is authenticated, which org/pod it points at, and the server version."""
+    env_key = os.environ.get("INSIGHTLY_API_KEY")
+    key = SESSION.get("api_key") or env_key
+    name = SESSION.get("name") or ("env" if env_key else None)
+    pod = SESSION.get("pod") or os.environ.get("INSIGHTLY_POD") or "na1"
+    return {"connected": bool(key), "as": name, "pod": pod,
+            "read_only": READONLY, "version": SERVER_VERSION}
 
 @mcp.tool()
 def disconnect() -> dict:
@@ -243,38 +358,112 @@ def forget_saved(name: str) -> dict:
 def list_supported_objects() -> dict:
     """Common Insightly object endpoint names usable as `object`. Note British spelling
     'Organisations'. Anything else is reachable via raw_request."""
-    return {"objects": COMMON_OBJECTS, "read_only": READONLY}
+    return {"objects": COMMON_OBJECTS, "read_only": READONLY, "version": SERVER_VERSION}
 
 @mcp.tool()
-async def list_records(object: str, ctx: Context, top: int = 20, skip: int = 0, brief: bool = False,
+async def list_records(object: str, ctx: Context, top: int = 100, skip: int = 0, brief: bool = True,
                        order_by: Optional[str] = None, updated_after_utc: Optional[str] = None,
-                       count_total: bool = False) -> Any:
-    """List records for an object (e.g. 'Contacts'). top<=500 (default 20), skip for
-    paging, order_by like 'DATE_UPDATED_UTC desc', updated_after_utc like
-    '2026-01-01T00:00:00Z'. Prompts for a key on first use."""
+                       count_total: bool = False, fetch_all: bool = False, max_records: int = 1000) -> Any:
+    """List records for an object (e.g. 'Contacts'). Returns a paginated envelope:
+    {items, returned, skip, top, has_more, next_skip[, total]}.
+
+    - brief defaults True (top-level fields only — far smaller). Pass brief=false for
+      every field incl. linked/custom fields.
+    - Paging: default top=100 (max 500). If has_more is true, call again with the
+      returned next_skip — OR pass fetch_all=true to get everything at once.
+    - fetch_all=true pages through the whole object up to max_records (default 1000,
+      hard cap 5000), rate-paced under the API limit; returns
+      {items, total_fetched, truncated}. truncated=true means the cap was hit and more remain.
+    - count_total=true adds the real `total` (from Insightly's X-Total-Count header).
+    - updated_after_utc like '2026-01-01T00:00:00Z' for incremental pulls.
+    - order_by like 'DATE_UPDATED_UTC desc' sorts the RETURNED records CLIENT-SIDE
+      (the API has no sort param); combine with fetch_all for a global sort.
+
+    For finding specific records prefer search_records (exact) or filter_records (contains)."""
     err = await _ensure(ctx)
     if err:
         return {"error": err}
-    params: dict = {"top": min(max(top, 1), 500), "skip": max(skip, 0),
-                    "brief": str(brief).lower(), "count_total": str(count_total).lower()}
-    if order_by:
-        params["order_by"] = order_by
+    o = _obj(object)
+    if fetch_all:
+        res = await _fetch_all(o, brief=brief, updated_after_utc=updated_after_utc, max_records=max_records)
+        if order_by and isinstance(res.get("items"), list):
+            res["items"] = _apply_sort(res["items"], order_by)
+        return res
+    page = min(max(top, 1), PAGE_MAX)
+    params: dict = {"top": page, "skip": max(skip, 0), "brief": str(brief).lower()}
     if updated_after_utc:
         params["updated_after_utc"] = updated_after_utc
-    result = await _request("GET", f"/{_obj(object)}", params=params)
-    return _brief_strip(result) if brief else result
+    if count_total:
+        params["count_total"] = "true"
+    body, headers = await _request("GET", f"/{o}", params=params, want_headers=True)
+    if isinstance(body, dict) and body.get("error"):
+        if str(body.get("error", "")).startswith("HTTP 4"):
+            body["hint"] = "check the object name via list_supported_objects; some objects aren't listable via GET."
+        return body
+    items = body if isinstance(body, list) else []
+    if brief:
+        _brief_strip(items)
+    if order_by:
+        items = _apply_sort(items, order_by)
+    env = _page_envelope(items, max(skip, 0), page)
+    if count_total:
+        tot = headers.get("x-total-count")
+        if tot is not None:
+            try:
+                env["total"] = int(tot)
+            except Exception:
+                env["total"] = tot
+    return env
 
 @mcp.tool()
 async def search_records(object: str, field_name: str, field_value: str, ctx: Context,
                          top: int = 20, skip: int = 0) -> Any:
-    """Exact-match field search, e.g.
-    search_records('Contacts', 'EMAIL_ADDRESS', 'jane@example.com')."""
+    """EXACT-match search on a single field (the API does not do partial match here), e.g.
+    search_records('Contacts', 'EMAIL_ADDRESS', 'jane@example.com'). For substring matching
+    use filter_records. Returns a paginated envelope like list_records."""
     err = await _ensure(ctx)
     if err:
         return {"error": err}
-    return await _request("GET", f"/{_obj(object)}/Search",
+    page = min(max(top, 1), PAGE_MAX)
+    body = await _request("GET", f"/{_obj(object)}/Search",
                           params={"field_name": field_name, "field_value": field_value,
-                                  "top": min(max(top, 1), 500), "skip": max(skip, 0)})
+                                  "top": page, "skip": max(skip, 0)})
+    if isinstance(body, dict) and body.get("error"):
+        return body
+    items = body if isinstance(body, list) else []
+    return _page_envelope(items, max(skip, 0), page)
+
+@mcp.tool()
+async def find_by_email(object: str, email: str, ctx: Context) -> Any:
+    """Convenience: find records by exact email address (e.g. Contacts, Leads).
+    Shortcut for search_records on EMAIL_ADDRESS."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    body = await _request("GET", f"/{_obj(object)}/Search",
+                          params={"field_name": "EMAIL_ADDRESS", "field_value": email, "top": 20})
+    if isinstance(body, dict) and body.get("error"):
+        return body
+    return _page_envelope(body if isinstance(body, list) else [], 0, 20)
+
+@mcp.tool()
+async def filter_records(object: str, field_name: str, contains: str, ctx: Context,
+                         brief: bool = True, max_scan: int = 1000) -> Any:
+    """CONTAINS filter, done CLIENT-SIDE because Insightly's search is exact-match only.
+    Scans up to max_scan records (default 1000, hard cap 5000, rate-paced) and returns
+    those whose field_name contains `contains` (case-insensitive). For exact match prefer
+    search_records. Returns {items, matched, scanned, truncated}."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    res = await _fetch_all(_obj(object), brief=brief, max_records=max_scan)
+    if res.get("error") and not res.get("items"):
+        return res
+    needle = (contains or "").lower()
+    hits = [r for r in res["items"] if isinstance(r, dict)
+            and needle in str(r.get(field_name, "")).lower()]
+    return {"items": hits, "matched": len(hits), "scanned": res.get("total_fetched", 0),
+            "truncated": res.get("truncated", False)}
 
 @mcp.tool()
 async def get_record(object: str, record_id: int, ctx: Context) -> Any:

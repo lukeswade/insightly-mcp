@@ -1,4 +1,8 @@
-# Get started with the Insightly MCP
+# Get started with the Insightly SE MCP (internal)
+
+> **Name:** the server appears in Claude's UI as **"Insightly SE MCP (internal)"**.
+> Its registration key stays `insightly` (the `claude mcp add insightly …` name and
+> the `mcpServers.insightly` config key), so tool names are unchanged.
 
 Drive any of our Insightly demo environments from Claude in plain English —
 search, create, update, annotate, and (carefully) delete CRM records. Works in

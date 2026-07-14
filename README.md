@@ -1,4 +1,4 @@
-# Insightly MCP server — interactive auth, full read/write
+# Insightly SE MCP (internal) — interactive auth, full read/write
 
 > **Sharing kit:** [OVERVIEW.md](OVERVIEW.md) — what it is & how it works ·
 > [ONBOARDING.md](ONBOARDING.md) — 2-minute setup for colleagues ·
@@ -31,14 +31,21 @@ Switch orgs anytime with `connect` (re-prompts) — handy across your many demo 
 | Tool | Does |
 |------|------|
 | `list_supported_objects` | Common object names |
-| `list_records(object, …)` | List (paged: top≤500, skip, brief, order_by, updated_after_utc) |
-| `search_records(object, field_name, field_value, …)` | Exact-match field search |
+| `list_records(object, …)` | List → `{items, returned, skip, top, has_more, next_skip}` envelope. `brief` defaults **true**; `top` default 100 (max 500). `count_total=true` adds the real `total`. `fetch_all=true` pages everything (to `max_records`, cap 5000). `order_by` sorts returned records client-side. `updated_after_utc` for incremental pulls. |
+| `search_records(object, field_name, field_value, …)` | **Exact-match** single-field search (paged envelope) |
+| `find_by_email(object, email)` | Convenience exact search on `EMAIL_ADDRESS` |
+| `filter_records(object, field_name, contains, …)` | **Contains** filter, done client-side (scans up to `max_scan`) since the API is exact-match only |
 | `get_record(object, record_id)` | One record (shows field names) |
 | `create_record(object, fields)` | Create |
 | `update_record(object, record_id, fields)` | Partial update |
 | `delete_record(object, record_id, confirm)` | **Permanent** delete — needs `confirm=true` |
 | `add_note(parent_object, parent_id, title, body)` | Attach a note |
 | `raw_request(method, path, query, body)` | Any other endpoint |
+
+Built for record-heavy envs: a pooled keep-alive connection (not a fresh client per
+call), client-side rate pacing under the API's 10 req/s limit, and brief-by-default
+listing so responses stay small. The API has **no server-side sort** — `order_by` is
+applied client-side over what was fetched (pair with `fetch_all` for a global sort).
 
 ## Setup
 No credentials needed at install — you'll be prompted on first use:
@@ -61,8 +68,8 @@ orchestration), `INSIGHTLY_READONLY=1` (safe read-only), `INSIGHTLY_KEYS_FILE`
 - **Keys** live in memory by default; only saved to disk if you choose, and never
   passed as tool arguments (so they don't enter the model/transcript) — except the
   `set_api_key` fallback, where the key is necessarily in the call.
-- **Rate limits:** ~10 req/sec + a daily cap by plan; the server retries on 429.
-  `top` defaults to 20 (max 500).
+- **Rate limits:** ~10 req/sec + a daily cap by plan; the server paces itself under
+  that limit and retries on 429. `top` defaults to 100 (max 500).
 
 ## Notes
 - Object names are PascalCase plural; `Organisations` is British-spelled (server also

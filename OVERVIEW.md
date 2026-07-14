@@ -1,4 +1,4 @@
-# Insightly MCP — Overview
+# Insightly SE MCP (internal) — Overview
 
 *Talk to any of our Insightly environments in plain English, from Claude.*
 
@@ -39,7 +39,7 @@ them conversationally drivable in seconds:
  You (plain English)
         │
         ▼
- Claude  ──── decides which tool to call ────►  Insightly MCP server (local Python)
+ Claude  ──── decides which tool to call ────►  Insightly SE MCP server (local Python)
         ▲                                              │   HTTPS (Basic auth, your API key)
         │                                              ▼
  results, summaries                          api.{pod}.insightly.com/v3.1
