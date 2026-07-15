@@ -1,0 +1,76 @@
+{
+  "manifest_version": "0.4",
+  "name": "insightly-se-mcp-internal",
+  "display_name": "Insightly SE MCP (internal)",
+  "version": "2.0.0",
+  "description": "Drive Insightly demo environments from Claude in plain English — full read/write, fast paging, and search.",
+  "long_description": "Internal Solutions-Engineering tool. Talk to any Insightly demo env in plain English: list/search/create/update/annotate records across every object, with paginated results, an opt-in fetch_all, a real total count, and client-side contains filtering. One-click install: paste your Insightly API key into the secure field below — no config files, no Terminal JSON editing.",
+  "author": {
+    "name": "Luke Wade",
+    "url": "https://github.com/lukeswade/insightly-mcp"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lukeswade/insightly-mcp"
+  },
+  "homepage": "https://github.com/lukeswade/insightly-mcp",
+  "documentation": "https://github.com/lukeswade/insightly-mcp/blob/main/ONBOARDING.md",
+  "license": "MIT",
+  "keywords": ["insightly", "crm", "internal", "solutions-engineering"],
+  "server": {
+    "type": "python",
+    "entry_point": "server/insightly_mcp.py",
+    "mcp_config": {
+      "command": "${user_config.uv_path}",
+      "args": [
+        "run", "--with", "mcp", "--with", "httpx", "--with", "pydantic",
+        "python", "${__dirname}/server/insightly_mcp.py"
+      ],
+      "env": {
+        "INSIGHTLY_API_KEY": "${user_config.api_key}",
+        "INSIGHTLY_POD": "${user_config.pod}"
+      }
+    }
+  },
+  "user_config": {
+    "api_key": {
+      "type": "string",
+      "title": "Insightly API key",
+      "description": "Insightly → User Settings → API (any demo env). Stored securely by Claude; never shown in chat.",
+      "sensitive": true,
+      "required": true
+    },
+    "pod": {
+      "type": "string",
+      "title": "Insightly pod",
+      "description": "The region in your API URL — na1 (North America), eu1, or ap1.",
+      "default": "na1",
+      "required": true
+    },
+    "uv_path": {
+      "type": "file",
+      "title": "Path to uv",
+      "description": "The uv runner. In Terminal run `which uv`: Apple Silicon + Homebrew is /opt/homebrew/bin/uv; Intel Homebrew is /usr/local/bin/uv; the standalone installer uses ~/.local/bin/uv. Install uv first if needed: brew install uv.",
+      "default": "/opt/homebrew/bin/uv",
+      "required": true
+    }
+  },
+  "tools": [
+    { "name": "list_records", "description": "List records for any object (paged envelope; fetch_all; count_total)." },
+    { "name": "search_records", "description": "Exact-match single-field search." },
+    { "name": "find_by_email", "description": "Find records by exact email address." },
+    { "name": "filter_records", "description": "Client-side contains filter over a capped scan." },
+    { "name": "get_record", "description": "Fetch one record by id." },
+    { "name": "create_record", "description": "Create a record." },
+    { "name": "update_record", "description": "Partial update of a record." },
+    { "name": "delete_record", "description": "Permanently delete a record (needs confirm)." },
+    { "name": "add_note", "description": "Attach a note to a record." },
+    { "name": "connect", "description": "Authenticate / switch Insightly org." },
+    { "name": "connection_info", "description": "Show auth state, pod, and server version." },
+    { "name": "list_supported_objects", "description": "Common Insightly object names." },
+    { "name": "raw_request", "description": "Escape hatch for any v3.1 endpoint." }
+  ],
+  "compatibility": {
+    "platforms": ["darwin"]
+  }
+}

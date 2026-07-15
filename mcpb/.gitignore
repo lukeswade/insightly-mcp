@@ -1,0 +1,2 @@
+# The server file is copied in from the repo root at build time (single source of truth).
+server/
