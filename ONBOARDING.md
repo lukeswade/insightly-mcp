@@ -13,6 +13,12 @@ either way.
 > 📖 New to this? Read [OVERVIEW.md](OVERVIEW.md) first (what it is + how it works),
 > and open [demo.html](demo.html) in a browser to *see* the flow before installing.
 
+> ⚡ **Easiest (desktop app): one-click install.** Install `uv` once
+> (`brew install uv`), then download **`dist/insightly-se-mcp-<version>.mcpb`** and
+> double-click it — Claude installs it and asks for your API key in a secure field.
+> No config file, no Terminal JSON, no path typos. See [mcpb/README.md](mcpb/README.md).
+> Prefer the manual route, or using Claude Code? Read on.
+
 ## Prerequisites
 
 | You need | How to get it |
@@ -88,6 +94,26 @@ local key store), so: **demo envs only**.
 
 > 🌐 **claude.ai in the browser can't run this** — local MCP servers work in
 > Claude Code and the desktop app only. A hosted/shared version is on the ideas list.
+
+## Updating
+
+Already set up and need the latest version? Refresh the code and restart — your
+config and API key don't change.
+
+- **Desktop app, `.mcpb` install:** download the newest
+  `dist/insightly-se-mcp-<version>.mcpb`, double-click to reinstall, then **Cmd+Q**
+  and reopen Claude.
+- **Manual config, or Claude Code:** pull the latest code, then restart —
+  ```bash
+  git -C ~/insightly-mcp pull
+  ```
+  Restart: **Cmd+Q** and reopen the desktop app (closing the window isn't enough), or
+  `/exit` and relaunch Claude Code. *If the pull says "not a git repository," your
+  clone is elsewhere — check the path under Settings → Developer → insightly and pull
+  that folder.*
+
+**Confirm it worked:** ask Claude *"run the Insightly connection_info tool"* — it
+reports the current `version`.
 
 ## First use
 
