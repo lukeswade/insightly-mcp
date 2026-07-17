@@ -8,7 +8,8 @@ in plaintext).
 
 1. **Install `uv`** once (the bundle uses it to run the server):
    `brew install uv`  — or  `curl -LsSf https://astral.sh/uv/install.sh | sh`
-2. Download **`dist/insightly-se-mcp-<version>.mcpb`** from the repo.
+2. Download the bundle (direct link):
+   https://github.com/lukeswade/insightly-mcp/raw/main/dist/insightly-se-mcp-2.1.0.mcpb
 3. **Double-click it** (or Claude → Settings → Extensions → Advanced → Install Extension…).
 4. In the install dialog, fill:
    - **Insightly API key** (Insightly → User Settings → API) — stored securely.
@@ -27,6 +28,16 @@ in plaintext).
 Copies `insightly_mcp.py` into `mcpb/server/`, validates the manifest, and writes
 `dist/insightly-se-mcp-<version>.mcpb`. Bump `SERVER_VERSION` in `insightly_mcp.py`
 and the `version` in `mcpb/manifest.json` together, then rebuild.
+
+## Troubleshooting
+
+- **Extension installed but `insightly` never appears in chat:** Claude silently
+  skips an extension whose required config is missing — make sure the **API key**
+  field is filled, then toggle the extension off/on (or reinstall) and fully
+  restart (Cmd+Q).
+- **"Server disconnected" right after install:** the `uv` path is wrong for your
+  Mac. Run `which uv` in Terminal and put that value in the extension's
+  **Path to uv** setting (Settings → Extensions → Insightly SE MCP).
 
 ## Notes
 

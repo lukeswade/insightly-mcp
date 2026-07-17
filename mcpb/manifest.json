@@ -43,16 +43,16 @@
     "pod": {
       "type": "string",
       "title": "Insightly pod",
-      "description": "The region in your API URL — na1 (North America), eu1, or ap1.",
+      "description": "The region in your API URL — na1 (North America), eu1, or ap1. Leave as na1 unless yours differs.",
       "default": "na1",
-      "required": true
+      "required": false
     },
     "uv_path": {
       "type": "file",
       "title": "Path to uv",
-      "description": "The uv runner. In Terminal run `which uv`: Apple Silicon + Homebrew is /opt/homebrew/bin/uv; Intel Homebrew is /usr/local/bin/uv; the standalone installer uses ~/.local/bin/uv. Install uv first if needed: brew install uv.",
+      "description": "The uv runner. Leave the default on Apple Silicon + Homebrew. Otherwise run `which uv` in Terminal: Intel Homebrew is /usr/local/bin/uv; the standalone installer uses ~/.local/bin/uv. Install uv first if needed: brew install uv.",
       "default": "/opt/homebrew/bin/uv",
-      "required": true
+      "required": false
     }
   },
   "tools": [

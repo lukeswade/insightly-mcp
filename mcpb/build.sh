@@ -12,7 +12,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 
 VER="$(grep -oE 'SERVER_VERSION = "[^"]+"' "$ROOT/insightly_mcp.py" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
-echo "Server version: $VER"
+MVER="$(grep -oE '"version": "[0-9]+\.[0-9]+\.[0-9]+"' "$HERE/manifest.json" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+if [ "$VER" != "$MVER" ]; then
+  echo "ERROR: SERVER_VERSION ($VER) != manifest.json version ($MVER) — bump both together." >&2
+  exit 1
+fi
+echo "Version: $VER"
 
 # Keep a single source of truth: copy the canonical server into the bundle.
 mkdir -p "$HERE/server" "$ROOT/dist"

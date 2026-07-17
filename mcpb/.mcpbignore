@@ -1,0 +1,4 @@
+# Maintainer-only files — keep them out of the end-user bundle.
+build.sh
+.gitignore
+.mcpbignore
