@@ -32,7 +32,7 @@ import httpx
 from pydantic import BaseModel, Field
 from mcp.server.fastmcp import Context, FastMCP
 
-SERVER_VERSION = "2.1.0"
+SERVER_VERSION = "2.1.1"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -48,17 +48,34 @@ mcp = FastMCP("Insightly SE MCP (internal)")
 # Live credentials for THIS connection (in memory only).
 SESSION: dict = {"api_key": None, "pod": "na1", "name": None}
 
+# Endpoint names exactly as the v3.1 API exposes them (verified against swagger).
+# NOTE the API is inconsistent: most objects are plural, but Ticket, Product,
+# Quotation and Pricebook are SINGULAR (their plural forms 405). _obj() aliases
+# both forms so callers never have to care.
 PK = {
     "Contacts": "CONTACT_ID", "Organisations": "ORGANISATION_ID", "Leads": "LEAD_ID",
     "Opportunities": "OPPORTUNITY_ID", "Projects": "PROJECT_ID", "Tasks": "TASK_ID",
-    "Events": "EVENT_ID", "Notes": "NOTE_ID", "Products": "PRODUCT_ID",
-    "Emails": "EMAIL_ID", "Quotations": "QUOTATION_ID", "Milestones": "MILESTONE_ID",
-    "Pricebooks": "PRICEBOOK_ID", "Tickets": "TICKET_ID", "KnowledgeArticle": "ARTICLE_ID",
+    "Events": "EVENT_ID", "Notes": "NOTE_ID", "Product": "PRODUCT_ID",
+    "Emails": "EMAIL_ID", "Quotation": "QUOTE_ID", "Milestones": "MILESTONE_ID",
+    "Pricebook": "PRICEBOOK_ID", "Ticket": "TICKET_ID", "KnowledgeArticle": "ARTICLE_ID",
 }
 COMMON_OBJECTS = sorted(PK.keys()) + [
-    "Pipelines", "PipelineStages", "Relationships", "Tags", "Categories",
-    "Currencies", "CustomFields", "CustomObjects", "TeamMembers", "Users", "ActivitySets",
+    "Pipelines", "PipelineStages", "Relationships", "Tags", "Teams",
+    "LeadSources", "LeadStatuses", "Currencies", "CustomObjects",
+    "TeamMembers", "Users", "ActivitySets",
 ]
+
+# name (any case, singular or plural) → canonical endpoint. Built from the list
+# above; e.g. "tickets" → "Ticket", "contact" → "Contacts". US spellings included.
+_ALIASES: dict = {}
+for _c in COMMON_OBJECTS:
+    _ALIASES[_c.lower()] = _c
+for _c in COMMON_OBJECTS:
+    if _c.endswith("s"):
+        _ALIASES.setdefault(_c[:-1].lower(), _c)     # singular → canonical plural
+    else:
+        _ALIASES.setdefault(_c.lower() + "s", _c)    # plural → canonical singular
+_ALIASES["organizations"] = _ALIASES["organization"] = "Organisations"
 
 
 # ----------------------------------------------------------------- saved-keys store
@@ -152,8 +169,10 @@ def _safe(resp: Optional[httpx.Response]) -> Any:
         return (resp.text or "")[:500]
 
 def _obj(name: str) -> str:
+    """Normalise an object name to the API's canonical endpoint (case/plural-proof).
+    Unknown names pass through unchanged so raw endpoints still work."""
     n = (name or "").strip().strip("/")
-    return "Organisations" if n.lower() in ("organizations", "organization") else n
+    return _ALIASES.get(n.lower(), n)
 
 # Heavy fields Insightly's own `brief` mode fails to strip — full HTML/long free text
 # that bloats list results (e.g. a KnowledgeArticle Body can be tens of KB). We drop
@@ -389,8 +408,10 @@ def forget_saved(name: str) -> dict:
 # ------------------------------------------------------------------------ CRM tools
 @mcp.tool()
 def list_supported_objects() -> dict:
-    """Common Insightly object endpoint names usable as `object`. Note British spelling
-    'Organisations'. Anything else is reachable via raw_request."""
+    """Common Insightly object endpoint names usable as `object`. Case and plural are
+    normalised automatically (the API itself is inconsistent: Ticket/Product/Quotation/
+    Pricebook are singular, the rest plural; 'Organizations' US spelling also accepted).
+    Anything else is reachable via raw_request."""
     return {"objects": COMMON_OBJECTS, "read_only": READONLY, "version": SERVER_VERSION}
 
 @mcp.tool()
@@ -499,7 +520,7 @@ async def filter_records(object: str, contains: str, ctx: Context, field_name: O
             "truncated": res.get("truncated", False)}
 
 _SUMMARY_OBJECTS = ["Contacts", "Organisations", "Leads", "Opportunities", "Projects",
-                    "Tasks", "Events", "Notes", "Emails", "Tickets", "Products",
+                    "Tasks", "Events", "Notes", "Emails", "Ticket", "Product",
                     "KnowledgeArticle", "Users"]
 
 @mcp.tool()

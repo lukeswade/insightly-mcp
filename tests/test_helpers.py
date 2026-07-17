@@ -19,6 +19,23 @@ def test_obj_normalisation():
     assert m._obj("organization") == "Organisations"
     assert m._obj("  /Leads/ ") == "Leads"              # trims slashes/space
     assert m._obj("KnowledgeArticle") == "KnowledgeArticle"
+    # the API's singular objects: plural/case aliases resolve to the real endpoint
+    assert m._obj("Tickets") == "Ticket"
+    assert m._obj("products") == "Product"
+    assert m._obj("Quotations") == "Quotation"
+    assert m._obj("pricebooks") == "Pricebook"
+    # and singular aliases resolve to canonical-plural endpoints
+    assert m._obj("contact") == "Contacts"
+    assert m._obj("Lead") == "Leads"
+    # unknown endpoints pass through untouched (raw escape hatch)
+    assert m._obj("Prospect") == "Prospect"
+
+
+def test_pk_for_singular_objects():
+    assert m.PK["Ticket"] == "TICKET_ID"
+    assert m.PK["Product"] == "PRODUCT_ID"
+    assert m.PK["Quotation"] == "QUOTE_ID"      # NOT QUOTATION_ID — verified live
+    assert m.PK["Pricebook"] == "PRICEBOOK_ID"
 
 
 def test_brief_strip_drops_body():

@@ -75,8 +75,10 @@ orchestration), `INSIGHTLY_READONLY=1` (safe read-only), `INSIGHTLY_KEYS_FILE`
   that limit and retries on 429. `top` defaults to 100 (max 500).
 
 ## Notes
-- Object names are PascalCase plural; `Organisations` is British-spelled (server also
-  accepts `Organizations`).
+- Object names are normalised automatically — case, singular/plural, and US
+  `Organizations` all resolve to the API's real endpoints. (The API itself is
+  inconsistent: `Ticket`, `Product`, `Quotation`, `Pricebook` are singular; the
+  rest plural.)
 - `update_record` sends partial fields; for objects outside the built-in primary-key
   map, include the `*_ID` field yourself.
 - Requires Python 3.10+. `uv` runs it with deps inline, or `pip install -r requirements.txt`.
