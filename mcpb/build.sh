@@ -26,4 +26,6 @@ cp "$ROOT/insightly_mcp.py" "$HERE/server/insightly_mcp.py"
 MCPB=(npx -y @anthropic-ai/mcpb)
 "${MCPB[@]}" validate "$HERE/manifest.json"
 "${MCPB[@]}" pack "$HERE" "$ROOT/dist/insightly-se-mcp-$VER.mcpb"
-echo "Built dist/insightly-se-mcp-$VER.mcpb"
+# Stable alias so shared links (docs, the internal artifact page) never go stale.
+cp "$ROOT/dist/insightly-se-mcp-$VER.mcpb" "$ROOT/dist/insightly-se-mcp-latest.mcpb"
+echo "Built dist/insightly-se-mcp-$VER.mcpb (+ dist/insightly-se-mcp-latest.mcpb alias)"

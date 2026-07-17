@@ -8,8 +8,8 @@ in plaintext).
 
 1. **Install `uv`** once (the bundle uses it to run the server):
    `brew install uv`  — or  `curl -LsSf https://astral.sh/uv/install.sh | sh`
-2. Download the bundle (direct link — bump the version to the latest in `dist/`):
-   https://github.com/lukeswade/insightly-mcp/raw/main/dist/insightly-se-mcp-2.1.1.mcpb
+2. Download the bundle (stable link, always the newest build):
+   https://github.com/lukeswade/insightly-mcp/raw/main/dist/insightly-se-mcp-latest.mcpb
 3. **Double-click it** (or Claude → Settings → Extensions → Advanced → Install Extension…).
 4. In the install dialog, fill:
    - **Insightly API key** (Insightly → User Settings → API) — stored securely.
