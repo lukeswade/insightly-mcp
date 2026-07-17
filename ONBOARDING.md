@@ -128,6 +128,12 @@ model. (Desktop app with the `env` block: no prompt — it just answers.)
 
 Things to try next:
 
+- *"What's in this env?"* → one call (`env_summary`) returns real record counts across
+  every core object — the ideal first question in an unfamiliar demo env.
+- *"Seed 15 sample healthcare contacts with realistic intake statuses."* → Claude
+  checks the env's custom fields (`describe_object`) and batch-creates them
+  (`create_records`) in one shot.
+
 - *"Find the contact with email **jane@acme.com** and add a note that we spoke today."*
 - *"Create an organisation called **Acme Rockets** and a contact **Jane Doe** in it."*
 - *"What opportunities are in this env? Show pipeline stages too."*

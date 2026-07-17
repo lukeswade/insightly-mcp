@@ -30,13 +30,16 @@ Switch orgs anytime with `connect` (re-prompts) — handy across your many demo 
 **CRM (act on the connected org):**
 | Tool | Does |
 |------|------|
+| `env_summary()` | One-call env overview: real record counts across the core objects — the perfect first call after connecting |
+| `describe_object(object)` | Field reference: standard fields + compact custom fields (types, dropdown options, lookup targets). Call before writing to an unfamiliar object |
 | `list_supported_objects` | Common object names |
 | `list_records(object, …)` | List → `{items, returned, skip, top, has_more, next_skip}` envelope. `brief` defaults **true**; `top` default 100 (max 500). `count_total=true` adds the real `total`. `fetch_all=true` pages everything (to `max_records`, cap 5000). `order_by` sorts returned records client-side. `updated_after_utc` for incremental pulls. |
 | `search_records(object, field_name, field_value, …)` | **Exact-match** single-field search (paged envelope) |
 | `find_by_email(object, email)` | Convenience exact search on `EMAIL_ADDRESS` |
-| `filter_records(object, field_name, contains, …)` | **Contains** filter, done client-side (scans up to `max_scan`) since the API is exact-match only |
+| `filter_records(object, contains, [field_name], …)` | **Contains** filter, client-side (scans up to `max_scan`) since the API is exact-match only. Omit `field_name` to match ANY field |
 | `get_record(object, record_id)` | One record (shows field names) |
 | `create_record(object, fields)` | Create |
+| `create_records(object, records)` | **Batch** create (≤50/call, rate-paced) — demo seeding in one call |
 | `update_record(object, record_id, fields)` | Partial update |
 | `delete_record(object, record_id, confirm)` | **Permanent** delete — needs `confirm=true` |
 | `add_note(parent_object, parent_id, title, body)` | Attach a note |

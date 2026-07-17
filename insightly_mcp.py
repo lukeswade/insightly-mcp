@@ -32,7 +32,7 @@ import httpx
 from pydantic import BaseModel, Field
 from mcp.server.fastmcp import Context, FastMCP
 
-SERVER_VERSION = "2.0.0"
+SERVER_VERSION = "2.1.0"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -171,7 +171,9 @@ def _brief_strip(data: Any) -> Any:
 
 def _apply_sort(items: Any, order_by: Optional[str]) -> Any:
     """CLIENT-SIDE sort of already-fetched records (the API has no sort param).
-    order_by like 'DATE_UPDATED_UTC desc'. Records missing the field sort last."""
+    order_by like 'DATE_UPDATED_UTC desc'. Records missing the field sort last.
+    Returns a new list; never mutates the input (a failed mixed-type sort could
+    otherwise leave it partially ordered)."""
     if not order_by or not isinstance(items, list):
         return items
     parts = str(order_by).split()
@@ -180,10 +182,41 @@ def _apply_sort(items: Any, order_by: Optional[str]) -> Any:
     present = [r for r in items if isinstance(r, dict) and r.get(field) is not None]
     missing = [r for r in items if not (isinstance(r, dict) and r.get(field) is not None)]
     try:
-        present.sort(key=lambda r: r.get(field), reverse=desc)
+        ordered = sorted(present, key=lambda r: r.get(field), reverse=desc)
     except TypeError:
-        present.sort(key=lambda r: str(r.get(field)), reverse=desc)
-    return present + missing
+        ordered = sorted(present, key=lambda r: str(r.get(field)), reverse=desc)
+    return ordered + missing
+
+
+def _record_contains(rec: Any, needle: str, field: Optional[str] = None) -> bool:
+    """Case-insensitive contains-match on one field, or (field=None) on every
+    scalar top-level value of the record."""
+    if not isinstance(rec, dict):
+        return False
+    if field:
+        return needle in str(rec.get(field, "")).lower()
+    return any(needle in str(v).lower()
+               for v in rec.values() if isinstance(v, (str, int, float)))
+
+
+def _cf_compact(f: dict) -> dict:
+    """Compact one /CustomFields entry to what the model needs to write records."""
+    out = {"name": f.get("FIELD_NAME"), "label": f.get("FIELD_LABEL"),
+           "type": f.get("FIELD_TYPE"), "editable": f.get("EDITABLE")}
+    opts = [o.get("OPTION_VALUE") for o in (f.get("CUSTOM_FIELD_OPTIONS") or []) if o.get("OPTION_VALUE")]
+    if opts:
+        out["options"] = opts
+    if f.get("JOIN_OBJECT"):
+        out["links_to"] = f["JOIN_OBJECT"]
+    return out
+
+
+def _write_hint(res: Any, o: str) -> Any:
+    """Attach a next-step hint to 4xx create/update failures (usually bad field names/values)."""
+    if isinstance(res, dict) and str(res.get("error", "")).startswith("HTTP 4"):
+        res.setdefault("hint", f"field names or option values may be wrong — call "
+                               f"describe_object('{o}') to see valid standard + custom fields.")
+    return res
 
 def _page_envelope(items: list, skip: int, top: int) -> dict:
     """Wrap a page of records so the model can tell there's more and where to resume."""
@@ -427,10 +460,10 @@ async def search_records(object: str, field_name: str, field_value: str, ctx: Co
     page = min(max(top, 1), PAGE_MAX)
     body = await _request("GET", f"/{_obj(object)}/Search",
                           params={"field_name": field_name, "field_value": field_value,
-                                  "top": page, "skip": max(skip, 0)})
+                                  "top": page, "skip": max(skip, 0), "brief": "true"})
     if isinstance(body, dict) and body.get("error"):
         return body
-    items = body if isinstance(body, list) else []
+    items = _brief_strip(body if isinstance(body, list) else [])
     return _page_envelope(items, max(skip, 0), page)
 
 @mcp.tool()
@@ -447,11 +480,12 @@ async def find_by_email(object: str, email: str, ctx: Context) -> Any:
     return _page_envelope(body if isinstance(body, list) else [], 0, 20)
 
 @mcp.tool()
-async def filter_records(object: str, field_name: str, contains: str, ctx: Context,
+async def filter_records(object: str, contains: str, ctx: Context, field_name: Optional[str] = None,
                          brief: bool = True, max_scan: int = 1000) -> Any:
     """CONTAINS filter, done CLIENT-SIDE because Insightly's search is exact-match only.
     Scans up to max_scan records (default 1000, hard cap 5000, rate-paced) and returns
-    those whose field_name contains `contains` (case-insensitive). For exact match prefer
+    those matching `contains` (case-insensitive) — in `field_name` if given, otherwise
+    in ANY top-level field ("find anything mentioning X"). For exact match prefer
     search_records. Returns {items, matched, scanned, truncated}."""
     err = await _ensure(ctx)
     if err:
@@ -460,10 +494,97 @@ async def filter_records(object: str, field_name: str, contains: str, ctx: Conte
     if res.get("error") and not res.get("items"):
         return res
     needle = (contains or "").lower()
-    hits = [r for r in res["items"] if isinstance(r, dict)
-            and needle in str(r.get(field_name, "")).lower()]
+    hits = [r for r in res["items"] if _record_contains(r, needle, field_name)]
     return {"items": hits, "matched": len(hits), "scanned": res.get("total_fetched", 0),
             "truncated": res.get("truncated", False)}
+
+_SUMMARY_OBJECTS = ["Contacts", "Organisations", "Leads", "Opportunities", "Projects",
+                    "Tasks", "Events", "Notes", "Emails", "Tickets", "Products",
+                    "KnowledgeArticle", "Users"]
+
+@mcp.tool()
+async def env_summary(ctx: Context) -> Any:
+    """One-call overview of the connected environment: real record counts for the core
+    objects (Contacts, Organisations, Leads, Opportunities, Projects, Tasks, Events,
+    Notes, Emails, Tickets, Products, KnowledgeArticle, Users). The perfect first call
+    after connecting — \"what's in this env?\"."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    counts: dict = {}
+    failed: dict = {}
+    for o in _SUMMARY_OBJECTS:
+        body, headers = await _request("GET", f"/{o}",
+                                       params={"top": 1, "brief": "true", "count_total": "true"},
+                                       want_headers=True)
+        if isinstance(body, dict) and body.get("error"):
+            failed[o] = body["error"]
+            continue
+        tot = headers.get("x-total-count")
+        try:
+            counts[o] = int(tot) if tot is not None else None
+        except Exception:
+            counts[o] = tot
+    out = {"connected_as": SESSION.get("name"), "pod": SESSION.get("pod"),
+           "version": SERVER_VERSION, "counts": counts}
+    if failed:
+        out["failed"] = failed
+    return out
+
+@mcp.tool()
+async def describe_object(object: str, ctx: Context) -> Any:
+    """Field reference for an object — call this BEFORE creating/updating records you
+    haven't touched yet. Returns `standard_fields` (from a sample record) and compact
+    `custom_fields` (name, label, type, dropdown options, lookup target) so payloads
+    use real field names and valid option values. Custom values go in CUSTOMFIELDS:
+    [{"FIELD_NAME": "...__c", "FIELD_VALUE": ...}]."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    o = _obj(object)
+    out: dict = {"object": o, "pk": PK.get(o)}
+    sample = await _request("GET", f"/{o}", params={"top": 1, "brief": "false"})
+    if isinstance(sample, list) and sample and isinstance(sample[0], dict):
+        out["standard_fields"] = [k for k in sample[0].keys() if k not in ("CUSTOMFIELDS", "ETag")]
+    elif isinstance(sample, dict) and sample.get("error"):
+        out["standard_fields_error"] = sample["error"]
+    else:
+        out["standard_fields"] = []
+        out["note"] = "no records yet — standard fields unavailable from a sample."
+    cfs = await _request("GET", f"/CustomFields/{o}")
+    if isinstance(cfs, list):
+        out["custom_fields"] = [_cf_compact(f) for f in cfs if isinstance(f, dict)]
+    else:
+        out["custom_fields"] = []
+    return out
+
+@mcp.tool()
+async def create_records(object: str, records: list, ctx: Context) -> Any:
+    """Batch-create up to 50 records in one call (rate-paced) — ideal for demo seeding,
+    e.g. \"create 20 sample contacts\". `records` is a list of `fields` dicts as in
+    create_record. Continues past individual failures. Returns
+    {created, failed, ids, errors: [{index, error}]}."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    if not isinstance(records, list) or not records:
+        return {"error": "pass a non-empty list of field dicts."}
+    if len(records) > 50:
+        return {"error": f"max 50 records per call (got {len(records)}) — split into batches."}
+    o = _obj(object)
+    pk = PK.get(o)
+    ids: list = []
+    errors: list = []
+    for i, fields in enumerate(records):
+        if not isinstance(fields, dict):
+            errors.append({"index": i, "error": "not a field dict"})
+            continue
+        res = _write_hint(await _request("POST", f"/{o}", json_body=fields), o)
+        if isinstance(res, dict) and res.get("error"):
+            errors.append({"index": i, "error": res.get("error"), **({"body": res["body"]} if res.get("body") else {})})
+        else:
+            ids.append(res.get(pk) if pk and isinstance(res, dict) else None)
+    return {"created": len(ids), "failed": len(errors), "ids": ids, "errors": errors}
 
 @mcp.tool()
 async def get_record(object: str, record_id: int, ctx: Context) -> Any:
@@ -480,7 +601,8 @@ async def create_record(object: str, fields: dict, ctx: Context) -> Any:
     err = await _ensure(ctx)
     if err:
         return {"error": err}
-    return await _request("POST", f"/{_obj(object)}", json_body=fields)
+    o = _obj(object)
+    return _write_hint(await _request("POST", f"/{o}", json_body=fields), o)
 
 @mcp.tool()
 async def update_record(object: str, record_id: int, fields: dict, ctx: Context) -> Any:
@@ -497,7 +619,7 @@ async def update_record(object: str, record_id: int, fields: dict, ctx: Context)
         body.setdefault(pk, record_id)
     elif not any(k.upper().endswith("_ID") for k in body):
         return {"error": f"unknown primary key for '{o}' — include its *_ID field in `fields`."}
-    return await _request("PUT", f"/{o}", json_body=body)
+    return _write_hint(await _request("PUT", f"/{o}", json_body=body), o)
 
 @mcp.tool()
 async def delete_record(object: str, record_id: int, ctx: Context, confirm: bool = False) -> Any:

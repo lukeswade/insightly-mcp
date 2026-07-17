@@ -49,6 +49,48 @@ def test_apply_sort_desc_and_nulls_last():
     assert m._apply_sort(rows, None) is rows
 
 
+def test_apply_sort_does_not_mutate_input():
+    rows = [{"n": 2}, {"n": "mixed"}, {"n": 1}]      # mixed types → str-key fallback
+    snapshot = [dict(r) for r in rows]
+    out = m._apply_sort(rows, "n asc")
+    assert rows == snapshot                            # input untouched
+    assert [r["n"] for r in out] == [1, 2, "mixed"]    # str-key order
+
+
+def test_record_contains_single_and_any_field():
+    rec = {"FIRST_NAME": "Tyler", "LAST_NAME": "Shedron", "AGE": 41, "CUSTOMFIELDS": []}
+    assert m._record_contains(rec, "shed", "LAST_NAME")
+    assert not m._record_contains(rec, "tyler", "LAST_NAME")
+    assert m._record_contains(rec, "tyler")            # any-field
+    assert m._record_contains(rec, "41")               # numeric scalar, any-field
+    assert not m._record_contains(rec, "zzz")
+    assert not m._record_contains("not a dict", "x")
+
+
+def test_cf_compact():
+    f = {"FIELD_NAME": "Intake_Status__c", "FIELD_LABEL": "Intake Status",
+         "FIELD_TYPE": "DROPDOWN", "EDITABLE": True, "FIELD_HELP_TEXT": None,
+         "CUSTOM_FIELD_OPTIONS": [{"OPTION_ID": 1, "OPTION_VALUE": "Admitted"},
+                                  {"OPTION_ID": 2, "OPTION_VALUE": ""}],
+         "JOIN_OBJECT": None, "DEPENDENCY": None}
+    c = m._cf_compact(f)
+    assert c == {"name": "Intake_Status__c", "label": "Intake Status",
+                 "type": "DROPDOWN", "editable": True, "options": ["Admitted"]}
+    lookup = m._cf_compact({"FIELD_NAME": "Clinician__c", "FIELD_LABEL": "Clinician",
+                            "FIELD_TYPE": "LOOKUPRELATIONSHIP", "EDITABLE": True,
+                            "CUSTOM_FIELD_OPTIONS": [], "JOIN_OBJECT": "Contact"})
+    assert lookup["links_to"] == "Contact" and "options" not in lookup
+
+
+def test_write_hint_only_on_4xx():
+    hinted = m._write_hint({"error": "HTTP 400", "body": "bad"}, "Contacts")
+    assert "describe_object" in hinted["hint"]
+    ok = m._write_hint({"CONTACT_ID": 1}, "Contacts")
+    assert "hint" not in ok
+    server_err = m._write_hint({"error": "HTTP 500"}, "Contacts")
+    assert "hint" not in server_err
+
+
 def test_page_envelope_has_more():
     # a full page implies there may be more
     full = m._page_envelope([{}, {}, {}], skip=0, top=3)

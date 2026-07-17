@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "insightly-se-mcp-internal",
   "display_name": "Insightly SE MCP (internal)",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Drive Insightly demo environments from Claude in plain English — full read/write, fast paging, and search.",
   "long_description": "Internal Solutions-Engineering tool. Talk to any Insightly demo env in plain English: list/search/create/update/annotate records across every object, with paginated results, an opt-in fetch_all, a real total count, and client-side contains filtering. One-click install: paste your Insightly API key into the secure field below — no config files, no Terminal JSON editing.",
   "author": {
@@ -56,12 +56,15 @@
     }
   },
   "tools": [
+    { "name": "env_summary", "description": "One-call overview: real record counts across core objects." },
+    { "name": "describe_object", "description": "Field reference: standard + custom fields with types and dropdown options." },
     { "name": "list_records", "description": "List records for any object (paged envelope; fetch_all; count_total)." },
     { "name": "search_records", "description": "Exact-match single-field search." },
     { "name": "find_by_email", "description": "Find records by exact email address." },
     { "name": "filter_records", "description": "Client-side contains filter over a capped scan." },
     { "name": "get_record", "description": "Fetch one record by id." },
     { "name": "create_record", "description": "Create a record." },
+    { "name": "create_records", "description": "Batch-create up to 50 records in one call (demo seeding)." },
     { "name": "update_record", "description": "Partial update of a record." },
     { "name": "delete_record", "description": "Permanently delete a record (needs confirm)." },
     { "name": "add_note", "description": "Attach a note to a record." },
