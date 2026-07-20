@@ -8,6 +8,8 @@ in plaintext).
 
 1. **Install `uv`** once (the bundle uses it to run the server):
    `brew install uv`  — or  `curl -LsSf https://astral.sh/uv/install.sh | sh`
+   > The install only registers in **new** Terminal windows — `which uv` in the same
+   > window says "not found". Close Terminal (or open a new window) before checking.
 2. Download the bundle (stable link, always the newest build):
    https://github.com/lukeswade/insightly-mcp/raw/main/dist/insightly-se-mcp-latest.mcpb
 3. **Double-click it** (or Claude → Settings → Extensions → Advanced → Install Extension…).
@@ -17,7 +19,8 @@ in plaintext).
    - **Path to uv** — defaults to `/opt/homebrew/bin/uv` (Apple Silicon + Homebrew).
      If `which uv` in Terminal prints a different path (Intel: `/usr/local/bin/uv`;
      standalone installer: `~/.local/bin/uv`), set that.
-5. Done — ask Claude *"list my Insightly contacts."*
+5. Done — ask Claude *"list my Insightly contacts."* The **first** question takes up
+   to a minute: `uv` downloads its own Python + packages once, then it's fast.
 
 ## Build (for maintainers)
 
@@ -36,8 +39,11 @@ and the `version` in `mcpb/manifest.json` together, then rebuild.
   field is filled, then toggle the extension off/on (or reinstall) and fully
   restart (Cmd+Q).
 - **"Server disconnected" right after install:** the `uv` path is wrong for your
-  Mac. Run `which uv` in Terminal and put that value in the extension's
-  **Path to uv** setting (Settings → Extensions → Insightly SE MCP).
+  Mac. Run `which uv` in a **new** Terminal window and put that value in the
+  extension's **Path to uv** setting (Settings → Extensions → Insightly SE MCP).
+- **First question hangs/fails with a Python-flavored error:** normally `uv`
+  fetches a Python automatically on first run; the manual nudge is
+  `uv python install 3.12` in a new Terminal window, then Cmd+Q Claude and retry.
 
 ## Notes
 
