@@ -247,8 +247,11 @@ def part4_apps() -> None:
               "profile=mcp-app" in str(uris[hit].get("mimeType", "")),
               f"mimeType={uris[hit].get('mimeType')}")
         meta = (uris[hit].get("_meta") or {}).get("ui")
-        check("ui resource declares _meta.ui (hosts may require it to treat it as an app)",
-              isinstance(meta, dict) and "csp" in meta, f"_meta.ui={meta}")
+        # _meta.ui must EXIST (a host uses it to recognise an app view) but must NOT
+        # declare an empty-domain csp, which reads as "allow nothing" and blanks the page.
+        check("ui resource declares _meta.ui without a blocking csp",
+              isinstance(meta, dict) and meta.get("prefersBorder") is True and "csp" not in meta,
+              f"_meta.ui={meta}")
         rd = (s.rpc("resources/read", {"uri": hit}) or {}).get("result", {})
         body = (rd.get("contents") or [{}])[0].get("text", "")
         check("resource serves the HTML document", "<title>Insightly environment" in body,

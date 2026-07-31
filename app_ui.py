@@ -17,26 +17,31 @@ button falls back to asking the same question in chat via `ui/message`.
 
 ENV_DASHBOARD_HTML = """<!doctype html>
 <meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
 <title>Insightly environment</title>
 <style>
   :root {
-    --bg: transparent; --card: #FFFFFF; --card2: #F7F4EF; --ink: #211B14;
+    --bg: #FBF9F6; --card: #FFFFFF; --card2: #F7F4EF; --ink: #211B14;
     --muted: #6F6357; --line: #E4DED4; --accent: #D8382E; --good: #2E7D4F;
     --radius: 10px;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --card: #201B15; --card2: #191410; --ink: #EDE6DC; --muted: #A79B8D;
+    :root { --bg: #17130E; --card: #201B15; --card2: #191410; --ink: #EDE6DC; --muted: #A79B8D;
             --line: #352D23; --accent: #F2604F; --good: #63B888; }
   }
   :root[data-theme="dark"] {
-    --card: #201B15; --card2: #191410; --ink: #EDE6DC; --muted: #A79B8D;
+    --bg: #17130E; --card: #201B15; --card2: #191410; --ink: #EDE6DC; --muted: #A79B8D;
     --line: #352D23; --accent: #F2604F; --good: #63B888;
   }
   :root[data-theme="light"] {
-    --card: #FFFFFF; --card2: #F7F4EF; --ink: #211B14; --muted: #6F6357;
+    --bg: #FBF9F6; --card: #FFFFFF; --card2: #F7F4EF; --ink: #211B14; --muted: #6F6357;
     --line: #E4DED4; --accent: #D8382E; --good: #2E7D4F;
   }
   * { box-sizing: border-box; }
+  /* The widget must be legible before any host theming arrives: declare support for both
+     schemes so the browser picks the right one, and paint an opaque surface rather than
+     sitting transparent over an unknown background (dark ink on a dark host = "blank"). */
+  html { color-scheme: light dark; }
   body { margin: 0; padding: 14px; background: var(--bg); color: var(--ink);
          font: 14px/1.5 var(--font-family, "Avenir Next", -apple-system, system-ui, sans-serif); }
 

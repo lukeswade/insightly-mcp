@@ -34,14 +34,14 @@ import httpx
 import mcp_types as types
 from pydantic import BaseModel, Field
 from mcp.server import MCPServer
-from mcp.server.apps import Apps, ResourceCsp, client_supports_apps
+from mcp.server.apps import Apps, client_supports_apps
 from mcp.server.caching import CacheHint
 from mcp.server.extension import Extension, MethodBinding
 from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one has no .elicit
 
 from app_ui import ENV_DASHBOARD_HTML
 
-SERVER_VERSION = "3.1.1"
+SERVER_VERSION = "3.1.2"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -261,8 +261,9 @@ apps.add_html_resource(
     name="Insightly environment dashboard",
     title="Insightly environment",
     description="Record counts across the connected Insightly demo environment.",
-    csp=ResourceCsp(connect_domains=[], resource_domains=[],
-                    frame_domains=[], base_uri_domains=[]),
+    # NOTE: do NOT declare an empty-domain csp here. It reads as "allow nothing" and can
+    # block this page's own inline <style>/<script>, which renders the widget blank.
+    # prefers_border alone is enough to make the resource's _meta.ui block exist.
     prefers_border=True,
 )
 
