@@ -116,7 +116,7 @@ ENV_DASHBOARD_HTML = """<!doctype html>
      document at all and no amount of CSS work will help. -->
 <div style="padding:8px 10px;margin:0 0 12px;border-radius:8px;background:#8b8b8b40;
             color:#f5f5f5;font:600 13px/1.4 -apple-system,system-ui,sans-serif">
-  Insightly dashboard loaded ✓ <span style="font-weight:400;opacity:.8">(v3.1.5 probe)</span>
+  Insightly dashboard loaded ✓ <span style="font-weight:400;opacity:.8">(v3.1.6 probe)</span>
 </div>
 
 <header>
@@ -213,7 +213,7 @@ ENV_DASHBOARD_HTML = """<!doctype html>
     finishHandshake();
   }).catch(function () {
     // Some hosts don't answer ui/initialize. Announce readiness anyway: a host that only
-    // pushes tool-result after `initialized` would otherwise never send us data, leaving
+    // pushes tool-result after the initialized notification would otherwise never send
     // a permanently blank widget.
     finishHandshake();
   });
