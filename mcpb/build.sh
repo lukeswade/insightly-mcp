@@ -70,6 +70,20 @@ if missing or phantom:
 print(f"manifest tool list matches the server ({len(model)} model-facing tools)")
 PYCHECK
 
+# The host injects the view via document.write(); a backslash escape or backtick in the
+# document survives into a JS string it builds and produces
+# "SyntaxError: Failed to execute 'write' on 'Document'" — a blank widget. Ban both.
+python3 - "$ROOT" <<'PYUI'
+import pathlib, re, sys
+src = (pathlib.Path(sys.argv[1]) / "app_ui.py").read_text()
+html = re.search(r'ENV_DASHBOARD_HTML = """(.*)"""', src, re.S).group(1)
+bad = {"backslash": html.count("\\"), "backtick": html.count("`")}
+if any(bad.values()):
+    print(f"ERROR: widget HTML contains embedding hazards: {bad}", file=sys.stderr)
+    raise SystemExit(1)
+print("widget HTML is free of document.write embedding hazards")
+PYUI
+
 MCPB=(npx -y @anthropic-ai/mcpb)
 # MCPB_SUFFIX builds a side-by-side artifact and does NOT move the -latest alias, so a
 # pre-release can be install-tested without changing what colleagues download.
