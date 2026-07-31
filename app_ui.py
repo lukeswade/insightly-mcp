@@ -45,7 +45,9 @@ ENV_DASHBOARD_HTML = """<!doctype html>
      schemes so the browser picks the right one, and paint an opaque surface rather than
      sitting transparent over an unknown background (dark ink on a dark host = "blank"). */
   html { color-scheme: light dark; }
-  body { margin: 0; padding: 14px; background: var(--bg); color: var(--ink);
+  /* Guarantee a non-zero height at first paint: a zero-height iframe is invisible even
+     when everything else is correct. */
+  body { margin: 0; padding: 14px; min-height: 140px; background: var(--bg); color: var(--ink);
          font: 14px/1.5 var(--font-family, "Avenir Next", -apple-system, system-ui, sans-serif); }
 
   header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
@@ -114,7 +116,7 @@ ENV_DASHBOARD_HTML = """<!doctype html>
      document at all and no amount of CSS work will help. -->
 <div style="padding:8px 10px;margin:0 0 12px;border-radius:8px;background:#8b8b8b40;
             color:#f5f5f5;font:600 13px/1.4 -apple-system,system-ui,sans-serif">
-  Insightly dashboard loaded ✓ <span style="font-weight:400;opacity:.8">(v3.1.4 probe)</span>
+  Insightly dashboard loaded ✓ <span style="font-weight:400;opacity:.8">(v3.1.5 probe)</span>
 </div>
 
 <header>

@@ -41,7 +41,7 @@ from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one 
 
 from app_ui import ENV_DASHBOARD_HTML
 
-SERVER_VERSION = "3.1.4"
+SERVER_VERSION = "3.1.5"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -270,6 +270,11 @@ apps.add_html_resource(
 
 @apps.tool(resource_uri="ui://insightly/env-dashboard.html",
            visibility=["model", "app"],
+           # Compatibility shim: the SDK stamps only the current nested
+           # _meta.ui.resourceUri, but some shipped hosts read ONLY the deprecated flat
+           # key. Emitting both is the documented field workaround and is harmless — a
+           # host that doesn't recognise the flat key ignores it.
+           meta={"ui/resourceUri": "ui://insightly/env-dashboard.html"},
            name="env_dashboard",
            description="Interactive dashboard of what's in the connected Insightly "
                        "environment — record counts per object, with the day's remaining "
