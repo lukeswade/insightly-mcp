@@ -246,6 +246,9 @@ def part4_apps() -> None:
         check("resource declares the mcp-app MIME type",
               "profile=mcp-app" in str(uris[hit].get("mimeType", "")),
               f"mimeType={uris[hit].get('mimeType')}")
+        meta = (uris[hit].get("_meta") or {}).get("ui")
+        check("ui resource declares _meta.ui (hosts may require it to treat it as an app)",
+              isinstance(meta, dict) and "csp" in meta, f"_meta.ui={meta}")
         rd = (s.rpc("resources/read", {"uri": hit}) or {}).get("result", {})
         body = (rd.get("contents") or [{}])[0].get("text", "")
         check("resource serves the HTML document", "<title>Insightly environment" in body,

@@ -34,7 +34,7 @@ import httpx
 import mcp_types as types
 from pydantic import BaseModel, Field
 from mcp.server import MCPServer
-from mcp.server.apps import Apps, client_supports_apps
+from mcp.server.apps import Apps, ResourceCsp, client_supports_apps
 from mcp.server.caching import CacheHint
 from mcp.server.extension import Extension, MethodBinding
 from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one has no .elicit
@@ -252,11 +252,18 @@ class _TasksExtension(Extension):
 # below returns the same numbers as data no matter what — the UI is a bonus, never a
 # requirement.
 apps = Apps()
+# prefers_border/csp/permissions are what populate the resource's `_meta.ui` block. With
+# none of them passed, `_meta` is omitted entirely — and a host looking for `_meta.ui` to
+# decide "is this an app view?" would skip it. Declare an explicit (empty-domain) CSP so
+# the block always exists: we load nothing external, so no origins are allowed.
 apps.add_html_resource(
     "ui://insightly/env-dashboard.html", ENV_DASHBOARD_HTML,
     name="Insightly environment dashboard",
     title="Insightly environment",
     description="Record counts across the connected Insightly demo environment.",
+    csp=ResourceCsp(connect_domains=[], resource_domains=[],
+                    frame_domains=[], base_uri_domains=[]),
+    prefers_border=True,
 )
 
 
