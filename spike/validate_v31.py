@@ -11,6 +11,7 @@ Run:
 """
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import threading
@@ -224,6 +225,99 @@ def part3_spike2(_: object) -> None:
     s2.close()
 
 
+def part4_apps() -> None:
+    print("\n4. Apps UI (io.modelcontextprotocol/ui)")
+    s = Server(capabilities={"elicitation": {"form": {}}})
+    tl = (s.rpc("tools/list") or {}).get("result", {})
+    tools = {t["name"]: t for t in tl.get("tools", [])}
+    check("env_dashboard tool is registered", "env_dashboard" in tools,
+          f"{len(tools)} tools total")
+    meta = (tools.get("env_dashboard", {}) or {}).get("_meta", {})
+    ui = meta.get("ui", {}) if isinstance(meta, dict) else {}
+    check("tool carries _meta.ui.resourceUri",
+          str(ui.get("resourceUri", "")).startswith("ui://"),
+          f"ui={ui}")
+
+    res = (s.rpc("resources/list") or {}).get("result", {})
+    uris = {r.get("uri"): r for r in res.get("resources", [])}
+    hit = next((u for u in uris if str(u).startswith("ui://")), None)
+    check("ui:// resource is listed", bool(hit), f"uris={list(uris)}")
+    if hit:
+        check("resource declares the mcp-app MIME type",
+              "profile=mcp-app" in str(uris[hit].get("mimeType", "")),
+              f"mimeType={uris[hit].get('mimeType')}")
+        rd = (s.rpc("resources/read", {"uri": hit}) or {}).get("result", {})
+        body = (rd.get("contents") or [{}])[0].get("text", "")
+        check("resource serves the HTML document", "<title>Insightly environment" in body,
+              f"{len(body)} chars")
+        pathlib.Path("/tmp/app_ui_served.html").write_text(body)
+
+    out = s.call("env_dashboard")
+    check("dashboard tool returns real counts",
+          isinstance(out.get("counts"), dict) and out["counts"].get("Contacts") == 81,
+          f"contacts={out.get('counts', {}).get('Contacts')}")
+    check("degrades for a non-Apps client (note present)", "note" in out,
+          str(out.get("note"))[:80])
+    check("dashboard reports the daily quota",
+          isinstance(out.get("daily_quota"), dict) and out["daily_quota"].get("remaining") is not None,
+          f"quota={out.get('daily_quota')}")
+    s.close()
+
+
+def part5_audit() -> None:
+    print("\n5. swagger/API-doc audit fixes")
+    s = Server(capabilities={})
+    s.call("list_records", {"object": "Contacts", "top": 1})  # quota is learned from a response
+    ci = s.call("connection_info")
+    check("connection_info surfaces the daily quota (after ≥1 call)",
+          isinstance(ci.get("daily_quota"), dict) and ci["daily_quota"].get("limit") is not None,
+          f"{ci.get('daily_quota')}")
+
+    sr = s.call("search_records", {"object": "Contacts", "field_name": "LAST_NAME",
+                                   "field_value": "Shedron", "count_total": True})
+    check("search_records supports count_total (X-Total-Count)",
+          sr.get("total") is not None and sr.get("returned", 0) >= 1,
+          f"total={sr.get('total')} returned={sr.get('returned')}")
+
+    ali = s.call("list_records", {"object": "quotes", "top": 1})
+    check("'quotes' aliases to Quotation (docs: 'Quote' is rejected)",
+          "error" not in ali or "405" not in str(ali.get("error")),
+          str(ali)[:90])
+
+    obj = s.call("list_supported_objects")
+    names = obj.get("objects", [])
+    check("audited collections are discoverable",
+          all(n in names for n in ("Instance", "Prospect", "PricebookEntry", "TaskCategories")),
+          f"{len(names)} objects listed")
+
+    inst = s.call("list_records", {"object": "Instance", "top": 1})
+    check("Instance endpoint works (identifies the env)",
+          inst.get("returned", 0) >= 1 or isinstance(inst.get("items"), list),
+          str(inst.get("items", [{}]))[:100])
+
+    # If-Match: a deliberately stale ETag must be refused, a fresh one accepted.
+    one = s.call("list_records", {"object": "Contacts", "top": 1, "brief": False})
+    rec = (one.get("items") or [{}])[0]
+    cid, etag = rec.get("CONTACT_ID"), rec.get("ETag")
+    stale = s.call("update_record", {"object": "Contacts", "record_id": cid,
+                                     "fields": {"TITLE": "concurrency probe"},
+                                     "if_match": "BOGUSETAG="})
+    check("stale If-Match is refused (with a hint)",
+          "error" in stale and "hint" in stale, str(stale)[:110])
+    fresh = s.call("update_record", {"object": "Contacts", "record_id": cid,
+                                     "fields": {"TITLE": rec.get("TITLE")},
+                                     "if_match": etag})
+    check("correct If-Match is accepted", "error" not in fresh, str(fresh)[:90])
+
+    links = s.call("list_links", {"object": "Contacts", "record_id": cid})
+    check("list_links works on a linkable object", not (isinstance(links, dict) and links.get("error")),
+          str(links)[:90])
+    bad = s.call("list_links", {"object": "Users", "record_id": 1})
+    check("non-linkable object is rejected clearly", "Linkable objects" in str(bad.get("error", "")),
+          str(bad.get("error"))[:80])
+    s.close()
+
+
 def main() -> int:
     part1_caching()
     s = Server(capabilities={"elicitation": {"form": {}}})
@@ -233,6 +327,8 @@ def main() -> int:
     finally:
         s.close()
     part3_spike2(None)
+    part4_apps()
+    part5_audit()
 
     failed = [r for r in results if r[0] == FAIL]
     print(f"\n=== {len(results) - len(failed)}/{len(results)} checks passed ===")

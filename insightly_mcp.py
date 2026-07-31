@@ -34,9 +34,12 @@ import httpx
 import mcp_types as types
 from pydantic import BaseModel, Field
 from mcp.server import MCPServer
+from mcp.server.apps import Apps, client_supports_apps
 from mcp.server.caching import CacheHint
 from mcp.server.extension import Extension, MethodBinding
 from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one has no .elicit
+
+from app_ui import ENV_DASHBOARD_HTML
 
 SERVER_VERSION = "3.1.0"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
@@ -46,6 +49,12 @@ KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insight
 PAGE_MAX = 500
 FETCH_ALL_HARD_CAP = 5000
 _MIN_INTERVAL = 0.12  # ~8.3 req/s ceiling, comfortably under the API's 10/s
+
+# Daily quota, learned from every response's X-RateLimit-* headers (verified live:
+# limit 100000 / remaining 99986 on a demo pod). The per-second cap is handled by the
+# pacer; the DAILY cap can't be waited out, so a 429 with remaining == 0 must fail fast
+# instead of burning retries.
+RATE: dict = {"limit": None, "remaining": None, "seen_at": None}
 
 
 # ------------------------------------------------------------------ background tasks
@@ -237,6 +246,39 @@ class _TasksExtension(Extension):
         ]
 
 
+# --------------------------------------------------------------------------- apps UI
+# MCP Apps (io.modelcontextprotocol/ui): a tool can point at a `ui://` HTML resource the
+# host renders inline. Per SEP-2133 an extension MUST degrade gracefully, so the tool
+# below returns the same numbers as data no matter what — the UI is a bonus, never a
+# requirement.
+apps = Apps()
+apps.add_html_resource(
+    "ui://insightly/env-dashboard.html", ENV_DASHBOARD_HTML,
+    name="Insightly environment dashboard",
+    title="Insightly environment",
+    description="Record counts across the connected Insightly demo environment.",
+)
+
+
+@apps.tool(resource_uri="ui://insightly/env-dashboard.html",
+           visibility=["model", "app"],
+           name="env_dashboard",
+           description="Interactive dashboard of what's in the connected Insightly "
+                       "environment — record counts per object, with the day's remaining "
+                       "API quota. Same data as env_summary, rendered inline.")
+async def env_dashboard(ctx: Context) -> Any:
+    """Render the environment overview as an inline dashboard."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    snap = await _env_snapshot()
+    # Degrade gracefully: a client without Apps still gets every number, plus a nudge.
+    if not client_supports_apps(ctx):
+        snap["note"] = ("this client can't render inline UI, so here are the raw counts "
+                        "(identical to env_summary).")
+    return snap
+
+
 # Display name shown in Claude's UI. The registration key stays `insightly`
 # (mcpServers key / `claude mcp add insightly`), so tool names are unchanged.
 #
@@ -246,7 +288,7 @@ class _TasksExtension(Extension):
 mcp = MCPServer(
     name="Insightly SE MCP (internal)",
     version=SERVER_VERSION,
-    extensions=[_TasksExtension()],
+    extensions=[_TasksExtension(), apps],
     cache_hints={
         # Tool/resource inventories only change when this file does.
         "server/discover": CacheHint(ttl_ms=3_600_000, scope="private"),
@@ -273,11 +315,23 @@ PK = {
     "Emails": "EMAIL_ID", "Quotation": "QUOTE_ID", "Milestones": "MILESTONE_ID",
     "Pricebook": "PRICEBOOK_ID", "Ticket": "TICKET_ID", "KnowledgeArticle": "ARTICLE_ID",
 }
+# Read-only / reference collections that exist in the v3.1 swagger. Listed so they are
+# discoverable and alias-resolvable; anything else still works via raw_request.
 COMMON_OBJECTS = sorted(PK.keys()) + [
     "Pipelines", "PipelineStages", "Relationships", "Tags", "Teams",
     "LeadSources", "LeadStatuses", "Currencies", "CustomObjects",
     "TeamMembers", "Users", "ActivitySets",
+    # added after auditing the swagger (all GET-able)
+    "Instance", "Countries", "Permissions", "Prospect", "DocumentTemplates",
+    "OpportunityCategories", "OpportunityStateReasons", "OpportunityLineItem",
+    "QuotationLineItem", "PricebookEntry", "ProjectCategories", "TaskCategories",
+    "FileCategories", "KnowledgeArticleCategory", "KnowledgeArticleFolder",
+    "MarketingVisits", "Follows",
 ]
+
+# Objects whose records can be linked to other records (swagger: /{obj}/{id}/Links).
+LINKABLE = ("Contacts", "Organisations", "Opportunities", "Projects",
+            "Tasks", "Events", "Notes", "Emails")
 
 # name (any case, singular or plural) → canonical endpoint. Built from the list
 # above; e.g. "tickets" → "Ticket", "contact" → "Contacts". US spellings included.
@@ -290,6 +344,9 @@ for _c in COMMON_OBJECTS:
     else:
         _ALIASES.setdefault(_c.lower() + "s", _c)    # plural → canonical singular
 _ALIASES["organizations"] = _ALIASES["organization"] = "Organisations"
+# The docs are explicit: the Quote endpoints use "Quotation"; "Quote" is rejected.
+_ALIASES["quote"] = _ALIASES["quotes"] = "Quotation"
+_ALIASES["knowledgearticles"] = _ALIASES["knowledge"] = "KnowledgeArticle"
 
 
 # ----------------------------------------------------------------- saved-keys store
@@ -423,6 +480,19 @@ def _safe(resp: Optional[httpx.Response]) -> Any:
     except Exception:
         return (resp.text or "")[:500]
 
+def _note_rate(headers: dict) -> None:
+    """Remember the daily-quota counters the API returns on every response."""
+    lim, rem = headers.get("x-ratelimit-limit"), headers.get("x-ratelimit-remaining")
+    if lim is None and rem is None:
+        return
+    try:
+        RATE["limit"] = int(lim) if lim is not None else RATE["limit"]
+        RATE["remaining"] = int(rem) if rem is not None else RATE["remaining"]
+        RATE["seen_at"] = _now()
+    except (TypeError, ValueError):
+        pass
+
+
 def _obj(name: str) -> str:
     """Normalise an object name to the API's canonical endpoint (case/plural-proof).
     Unknown names pass through unchanged so raw endpoints still work."""
@@ -538,7 +608,8 @@ async def _pace() -> None:
 
 
 async def _request(method: str, path: str, params: Optional[dict] = None,
-                   json_body: Any = None, want_headers: bool = False) -> Any:
+                   json_body: Any = None, want_headers: bool = False,
+                   headers: Optional[dict] = None) -> Any:
     """Perform one API call. Returns the parsed body, or (body, headers_lower) when
     want_headers=True (headers keyed lowercase). On failure returns an {'error': ...} body."""
     method = method.upper()
@@ -557,12 +628,22 @@ async def _request(method: str, path: str, params: Optional[dict] = None,
     for attempt in range(4):
         await _pace()
         try:
-            r = await client.request(method, path, params=params, json=json_body)
+            r = await client.request(method, path, params=params, json=json_body,
+                                     headers=headers or None)
         except Exception as e:
             return wrap({"error": f"request failed: {e}"})
         hdr = {k.lower(): v for k, v in r.headers.items()}
+        _note_rate(hdr)
         if r.status_code == 429:
             last = r
+            # Two different 429s: per-second burst (retryable) vs. daily quota
+            # exhausted (NOT retryable — the docs say no more requests until the next
+            # day). Tell them apart by the remaining counter.
+            if RATE.get("remaining") == 0:
+                return wrap({"error": "daily API quota exhausted (429). X-RateLimit-Remaining is 0 — "
+                                      f"the limit is {RATE.get('limit')} requests/day and resets "
+                                      "tomorrow. Retrying now won't help.",
+                             "rate_limit": dict(RATE)}, hdr)
             await asyncio.sleep(min(float(r.headers.get("Retry-After", 1.5)) * (attempt + 1), 12.0))
             continue
         if r.status_code == 401:
@@ -631,13 +712,19 @@ def set_api_key(api_key: str, pod: str = "na1", friendly_name: str = "", save: b
 
 @mcp.tool()
 def connection_info() -> dict:
-    """Show whether this connection is authenticated, which org/pod it points at, and the server version."""
+    """Show whether this connection is authenticated, which org/pod it points at, and the
+    server version. `daily_quota` (from Insightly's X-RateLimit-* headers) appears once at
+    least one API call has been made in this session — it is read from responses, not polled."""
     env_key = os.environ.get("INSIGHTLY_API_KEY")
     key = SESSION.get("api_key") or env_key
     name = SESSION.get("name") or ("env" if env_key else None)
     pod = SESSION.get("pod") or os.environ.get("INSIGHTLY_POD") or "na1"
-    return {"connected": bool(key), "as": name, "pod": pod,
-            "read_only": READONLY, "version": SERVER_VERSION}
+    out = {"connected": bool(key), "as": name, "pod": pod,
+           "read_only": READONLY, "version": SERVER_VERSION}
+    if RATE.get("limit") is not None:
+        out["daily_quota"] = {"limit": RATE["limit"], "remaining": RATE["remaining"],
+                              "as_of": RATE["seen_at"]}
+    return out
 
 @mcp.tool()
 def disconnect() -> dict:
@@ -726,21 +813,39 @@ async def list_records(object: str, ctx: Context, top: int = 100, skip: int = 0,
 
 @mcp.tool()
 async def search_records(object: str, field_name: str, field_value: str, ctx: Context,
-                         top: int = 20, skip: int = 0) -> Any:
+                         top: int = 20, skip: int = 0, count_total: bool = False,
+                         updated_after_utc: Optional[str] = None, brief: bool = True) -> Any:
     """EXACT-match search on a single field (the API does not do partial match here), e.g.
-    search_records('Contacts', 'EMAIL_ADDRESS', 'jane@example.com'). For substring matching
-    use filter_records. Returns a paginated envelope like list_records."""
+    search_records('Contacts', 'EMAIL_ADDRESS', 'jane@example.com'). Works on standard AND
+    custom fields (use the custom FIELD_NAME, e.g. 'Intake_Status__c'). For substring
+    matching use filter_records.
+
+    Supports the same paging extras as list_records: count_total=true adds the real
+    `total` from X-Total-Count, and updated_after_utc ('2026-01-01T00:00:00Z') filters by
+    change time. Returns a paginated envelope."""
     err = await _ensure(ctx)
     if err:
         return {"error": err}
     page = min(max(top, 1), PAGE_MAX)
-    body = await _request("GET", f"/{_obj(object)}/Search",
-                          params={"field_name": field_name, "field_value": field_value,
-                                  "top": page, "skip": max(skip, 0), "brief": "true"})
+    params: dict = {"field_name": field_name, "field_value": field_value,
+                    "top": page, "skip": max(skip, 0), "brief": str(brief).lower()}
+    if updated_after_utc:
+        params["updated_after_utc"] = updated_after_utc
+    if count_total:
+        params["count_total"] = "true"
+    body, hdrs = await _request("GET", f"/{_obj(object)}/Search", params=params, want_headers=True)
     if isinstance(body, dict) and body.get("error"):
         return body
-    items = _brief_strip(body if isinstance(body, list) else [])
-    return _page_envelope(items, max(skip, 0), page)
+    items = body if isinstance(body, list) else []
+    if brief:
+        _brief_strip(items)
+    env = _page_envelope(items, max(skip, 0), page)
+    if count_total and hdrs.get("x-total-count") is not None:
+        try:
+            env["total"] = int(hdrs["x-total-count"])
+        except ValueError:
+            env["total"] = hdrs["x-total-count"]
+    return env
 
 @mcp.tool()
 async def find_by_email(object: str, email: str, ctx: Context) -> Any:
@@ -783,10 +888,16 @@ async def env_summary(ctx: Context) -> Any:
     """One-call overview of the connected environment: real record counts for the core
     objects (Contacts, Organisations, Leads, Opportunities, Projects, Tasks, Events,
     Notes, Emails, Tickets, Products, KnowledgeArticle, Users). The perfect first call
-    after connecting — \"what's in this env?\"."""
+    after connecting — "what's in this env?". For the same thing as an interactive
+    dashboard, use env_dashboard."""
     err = await _ensure(ctx)
     if err:
         return {"error": err}
+    return await _env_snapshot()
+
+
+async def _env_snapshot() -> dict:
+    """Count the core objects. Shared by env_summary and the Apps dashboard."""
     counts: dict = {}
     failed: dict = {}
     for o in _SUMMARY_OBJECTS:
@@ -799,13 +910,16 @@ async def env_summary(ctx: Context) -> Any:
         tot = headers.get("x-total-count")
         try:
             counts[o] = int(tot) if tot is not None else None
-        except Exception:
+        except (TypeError, ValueError):
             counts[o] = tot
-    out = {"connected_as": SESSION.get("name"), "pod": SESSION.get("pod"),
-           "version": SERVER_VERSION, "counts": counts}
+    out: dict = {"connected_as": SESSION.get("name"), "pod": SESSION.get("pod"),
+                 "version": SERVER_VERSION, "counts": counts}
+    if RATE.get("remaining") is not None:
+        out["daily_quota"] = {"limit": RATE["limit"], "remaining": RATE["remaining"]}
     if failed:
         out["failed"] = failed
     return out
+
 
 @mcp.tool()
 async def describe_object(object: str, ctx: Context) -> Any:
@@ -904,10 +1018,16 @@ async def create_record(object: str, fields: dict, ctx: Context) -> Any:
     return _write_hint(await _request("POST", f"/{o}", json_body=fields), o)
 
 @mcp.tool()
-async def update_record(object: str, record_id: int, fields: dict, ctx: Context) -> Any:
+async def update_record(object: str, record_id: int, fields: dict, ctx: Context,
+                        if_match: Optional[str] = None, safe: bool = False) -> Any:
     """Partial update (send only changed fields). PK is filled in for common objects;
     otherwise include the *_ID field in `fields`. e.g.
-    update_record('Contacts', 12345, {'PHONE':'555-1212'})."""
+    update_record('Contacts', 12345, {'PHONE':'555-1212'}).
+
+    Optimistic concurrency (avoid clobbering someone else's edit): pass the record's
+    `ETag` as `if_match`, or `safe=true` to have the server fetch the current ETag first.
+    On a stale ETag Insightly rejects the write — note it answers **400**, not the 412 the
+    docs advertise (verified live)."""
     err = await _ensure(ctx)
     if err:
         return {"error": err}
@@ -918,7 +1038,20 @@ async def update_record(object: str, record_id: int, fields: dict, ctx: Context)
         body.setdefault(pk, record_id)
     elif not any(k.upper().endswith("_ID") for k in body):
         return {"error": f"unknown primary key for '{o}' — include its *_ID field in `fields`."}
-    return _write_hint(await _request("PUT", f"/{o}", json_body=body), o)
+    tag = if_match
+    if safe and not tag:
+        cur = await _request("GET", f"/{o}/{record_id}")
+        if isinstance(cur, dict) and cur.get("error"):
+            return {"error": f"couldn't read the current record to get its ETag: {cur['error']}"}
+        tag = cur.get("ETag") if isinstance(cur, dict) else None
+        if not tag:
+            return {"error": "safe=true but this record has no ETag — retry without safe."}
+    hdrs = {"If-Match": tag} if tag else None
+    res = _write_hint(await _request("PUT", f"/{o}", json_body=body, headers=hdrs), o)
+    if tag and isinstance(res, dict) and str(res.get("error", "")).startswith("HTTP 4"):
+        res["hint"] = ("the record changed since you read that ETag (Insightly returns 400 here, "
+                       "not 412). Re-read it with get_record and retry.")
+    return res
 
 @mcp.tool()
 async def delete_record(object: str, record_id: int, ctx: Context, confirm: bool = False) -> Any:
@@ -948,6 +1081,63 @@ async def raw_request(method: str, path: str, ctx: Context,
     if err:
         return {"error": err}
     return await _request(method, "/" + path.lstrip("/"), params=query, json_body=body)
+
+
+# ------------------------------------------------------------------------ link tools
+# Insightly models cross-object relationships as Links on the record
+# (/{Object}/{id}/Links). Note LINK_OBJECT_NAME is SINGULAR — "Organisation", "Contact",
+# "Opportunity" — even though the endpoints are plural.
+@mcp.tool()
+async def list_links(object: str, record_id: int, ctx: Context) -> Any:
+    """Show what a record is linked to (linked contacts, organisations, opportunities…)."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    o = _obj(object)
+    if o not in LINKABLE:
+        return {"error": f"'{o}' has no Links endpoint. Linkable objects: {', '.join(LINKABLE)}."}
+    return await _request("GET", f"/{o}/{record_id}/Links")
+
+@mcp.tool()
+async def link_records(object: str, record_id: int, link_object_name: str,
+                       link_object_id: int, ctx: Context,
+                       role: Optional[str] = None, details: Optional[str] = None) -> Any:
+    """Link two records, e.g. put a contact into an organisation:
+    link_records('Contacts', 123, 'Organisation', 456).
+
+    `link_object_name` is the SINGULAR object name ('Organisation', 'Contact',
+    'Opportunity', 'Project', 'Lead'). Both ids must already exist — look them up first
+    (search_records / find_by_email) rather than guessing."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    o = _obj(object)
+    if o not in LINKABLE:
+        return {"error": f"'{o}' has no Links endpoint. Linkable objects: {', '.join(LINKABLE)}."}
+    body: dict = {"LINK_OBJECT_NAME": link_object_name.strip(), "LINK_OBJECT_ID": link_object_id}
+    if role:
+        body["ROLE"] = role
+    if details:
+        body["DETAILS"] = details
+    res = await _request("POST", f"/{o}/{record_id}/Links", json_body=body)
+    if isinstance(res, dict) and str(res.get("error", "")).startswith("HTTP 4"):
+        res.setdefault("hint", "check both ids exist and that LINK_OBJECT_NAME is the SINGULAR "
+                               "object name (e.g. 'Organisation', not 'Organisations').")
+    return res
+
+@mcp.tool()
+async def unlink_records(object: str, record_id: int, link_id: int, ctx: Context,
+                         confirm: bool = False) -> Any:
+    """Remove a link (get link_id from list_links). Must pass confirm=true."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    if not confirm:
+        return {"error": "pass confirm=true to remove this link."}
+    o = _obj(object)
+    if o not in LINKABLE:
+        return {"error": f"'{o}' has no Links endpoint. Linkable objects: {', '.join(LINKABLE)}."}
+    return await _request("DELETE", f"/{o}/{record_id}/Links/{link_id}")
 
 
 # ------------------------------------------------------------------------ task tools

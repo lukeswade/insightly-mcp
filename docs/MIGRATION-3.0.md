@@ -1,7 +1,8 @@
 # v3.0 — migrating to MCP SDK 2.x (spec 2026-07-28)
 
-**Status:** Spikes 1 & 2 done; port + caching + tasks implemented and validated on this
-branch (18/18 checks — `spike/validate_v31.py`), **not merged**. `main` stays on the pinned
+**Status:** Spikes 1 & 2 done; port + caching + tasks + **Apps UI** + a full swagger/API-doc
+audit implemented and validated on this branch (**35/35** checks — `spike/validate_v31.py`,
+plus 10 unit tests), **not merged**. See also [API-AUDIT.md](API-AUDIT.md). `main` stays on the pinned
 SDK 1.29.0 (v2.1.4) until the bundle is repinned and install-tested.
 
 Everything below marked ✅ was verified by introspecting `mcp==2.0.0` locally on
@@ -120,16 +121,27 @@ held stream, web chat may now be able to satisfy it. Two things to try:
 - `elicit_url` mode as a browser-based key entry path.
 If either works, the env-injection workaround becomes optional rather than mandatory.
 
-## 5. The payoff — b & c DONE ✅, a (Apps UI) still to do
+## 5. The payoff — all three DONE ✅
 
-**a. Apps extension — interactive UI inline.** `mcp.server.apps` provides `Apps`, `Extension`,
-`ToolBinding`, `ResourceBinding`, `ResourceCsp`, `ResourcePermissions`, `Visibility`,
-`APP_MIME_TYPE`, and — importantly — **`client_supports_apps(ctx)`** for graceful degradation ✅.
-Highest-value targets, in order:
-1. **Demo-env picker** — replaces pasting keys into chat when switching envs.
-2. **`env_summary` as a dashboard** instead of a markdown table (the demo money shot).
-3. **Secure key entry form** — an alternative solution to the web-chat gap in Spike 2.
-4. Record tables / seeding confirmation.
+**a. Apps extension — DONE ✅ (env dashboard).** `apps.add_html_resource()` registers a `ui://`
+document served as `text/html;profile=mcp-app`; `@apps.tool(resource_uri=…)` stamps
+`_meta.ui.resourceUri` on a tool so the host renders it inline. Implemented `env_dashboard`
+(stat tiles per object, proportional bars, remaining daily API quota) with the HTML in
+[`app_ui.py`](../app_ui.py).
+
+**Two hard-won gotchas:**
+- **Apps contributions are collected when `MCPServer` is constructed.** A `@apps.tool` defined
+  *after* the constructor is silently ignored — the resource registered, the tool simply never
+  appeared. Declare app tools above the constructor.
+- **Data delivery to the iframe is the host's half of the contract** and isn't in the SDK, so the
+  page accepts the payload from several plausible channels (injected global or `postMessage`) and
+  shows a clear waiting state otherwise. **The visual result is unverified** — it needs a real
+  Apps-capable host. Server side is fully verified: tool registered with the right `_meta.ui`,
+  resource served with the right MIME type, and `client_supports_apps(ctx)` degradation returning
+  identical numbers plus an explanatory note (SEP-2133 requires this).
+
+Still to do: the **env picker** and a **key-entry form** both need the host's tool-call bridge
+from inside the iframe — worth doing once the dashboard is confirmed rendering.
 
 **b. Cacheable results — DONE ✅.** `MCPServer` takes a declarative `cache_hints=` mapping, so
 no middleware is needed (the SDK marks middleware "provisional"; avoid it). Implemented:
