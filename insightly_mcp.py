@@ -41,7 +41,7 @@ from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one 
 
 from app_ui import ENV_DASHBOARD_HTML
 
-SERVER_VERSION = "3.2.0"
+SERVER_VERSION = "3.2.1"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 

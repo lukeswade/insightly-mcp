@@ -575,7 +575,7 @@ ENV_DASHBOARD_HTML = """<!doctype html>
     var out = "";
     keys.forEach(function (k) {
       var rows = groups[k].slice().sort(function (a, b) {
-        return (b.STAGE_ORDER || 0) - (a.STAGE_ORDER || 0);   // stage number DESC
+        return (a.STAGE_ORDER || 0) - (b.STAGE_ORDER || 0);   // stage number ASC: pipeline order
       });
       out += '<div class="section-head" style="margin-top:10px"><h2>'
         + esc(names[k] || ("Pipeline " + k)) + '</h2><span>' + rows.length + ' stages</span></div>'
