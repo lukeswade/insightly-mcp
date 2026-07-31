@@ -180,7 +180,6 @@ ENV_DASHBOARD_HTML = """<!doctype html>
     protocolVersion: "2026-01-26",
     appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] }
   }).then(function (res) {
-    ready = true;
     var hc = (res && res.hostContext) || {};
     if (hc.theme === "light" || hc.theme === "dark") {
       document.documentElement.setAttribute("data-theme", hc.theme);
@@ -190,8 +189,32 @@ ENV_DASHBOARD_HTML = """<!doctype html>
     Object.keys(vars).forEach(function (k) {
       document.documentElement.style.setProperty(k.indexOf("--") === 0 ? k : "--" + k, vars[k]);
     });
+    finishHandshake();
+  }).catch(function () {
+    // Some hosts don't answer ui/initialize. Announce readiness anyway: a host that only
+    // pushes tool-result after `initialized` would otherwise never send us data, leaving
+    // a permanently blank widget.
+    finishHandshake();
+  });
+
+  function finishHandshake() {
+    if (ready) return;
+    ready = true;
     notify("ui/notifications/initialized", {});
-  }).catch(function () { /* no host bridge: the waiting state stands */ });
+    // Belt and braces: if no tool-result arrives shortly, fetch the data ourselves. A
+    // rendered-but-empty panel is the worst outcome, and this removes that possibility
+    // wherever the host allows an app-initiated tool call.
+    setTimeout(function () {
+      if (state.data) return;
+      callTool("env_dashboard", {})
+        .then(function (d) { if (d && d.counts) render(d); })
+        .catch(function () {
+          document.getElementById("body").innerHTML =
+            '<div class="wait">The dashboard loaded but the host sent no data, and it '
+            + 'wouldn\'t let this panel fetch it. The counts are in the message below.</div>';
+        });
+    }, 2500);
+  }
 
   // ----------------------------------------------------------------------- tool bridge
   // Try the app-only tool first, then the model-facing one (hosts differ in what they
