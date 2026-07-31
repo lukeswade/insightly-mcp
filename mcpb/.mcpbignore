@@ -2,3 +2,7 @@
 build.sh
 .gitignore
 .mcpbignore
+
+# Byte-code left behind when the build's tool-list check runs the server.
+__pycache__/
+*.pyc

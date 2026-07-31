@@ -187,6 +187,22 @@
     {
       "name": "raw_request",
       "description": "Escape hatch for any v3.1 endpoint."
+    },
+    {
+      "name": "set_api_key",
+      "description": "Set the API key without a prompt (non-interactive clients)."
+    },
+    {
+      "name": "disconnect",
+      "description": "Clear the in-memory key for this session."
+    },
+    {
+      "name": "list_saved",
+      "description": "List locally-saved keys (masked)."
+    },
+    {
+      "name": "forget_saved",
+      "description": "Delete a saved key by name."
     }
   ],
   "compatibility": {
