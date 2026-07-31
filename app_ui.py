@@ -100,6 +100,12 @@ ENV_DASHBOARD_HTML = """<!doctype html>
           border: 1px solid var(--line); color: var(--muted); }
   .chip b { color: var(--ink); font-weight: 600; }
   .muted { color: var(--muted); }
+  a.rec { color: inherit; text-decoration: none; border-bottom: 1px solid transparent;
+          cursor: pointer; }
+  a.rec:hover { color: var(--accent); border-bottom-color: var(--accent); }
+  a.rec:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+  .panel-head h2 a.rec:hover { color: var(--accent); }
+  .ext { font-size: 9px; opacity: .55; vertical-align: super; margin-left: 2px; }
   .err { color: var(--accent); font-size: 12.5px; }
   .wait, .empty-state { padding: 18px 2px; color: var(--muted); font-size: 13px; }
   .skel { height: 8px; border-radius: 4px; background: var(--line); animation: pulse 1.1s infinite; }
@@ -134,8 +140,6 @@ ENV_DASHBOARD_HTML = """<!doctype html>
   <button data-explore="Pipelines">Pipelines</button>
   <button data-explore="PipelineStages">Stages</button>
   <button data-explore="Users">Users</button>
-  <button data-explore="Tags">Tags</button>
-  <button data-explore="Currencies">Currencies</button>
 </div>
 
 <div id="body"><div class="wait">Waiting for environment data…</div></div>
@@ -277,6 +281,61 @@ ENV_DASHBOARD_HTML = """<!doctype html>
     });
   }
 
+  // ---------------------------------------------------------------- CRM deep links
+  // Insightly's blade view keeps the list in place and slides the record over it, which is
+  // what an SE actually wants; the full-page /details/... URL loses that context.
+  //   list:   https://crm.{pod}.insightly.com/list/Organisation/
+  //   record: https://crm.{pod}.insightly.com/list/Organisation/?blade=/details/organisation/{id}
+  // The list segment is singular PascalCase; the blade segment is the same word lowercased.
+  var CRM_SEG = {
+    Contacts: "Contact", Organisations: "Organisation", Leads: "Lead",
+    Opportunities: "Opportunity", Projects: "Project", Tasks: "Task", Events: "Event",
+    Notes: "Note", Emails: "Email", Ticket: "Ticket", Product: "Product",
+    Quotation: "Quotation", Pricebook: "Pricebook", Milestones: "Milestone",
+    KnowledgeArticle: "KnowledgeArticle"
+  };
+  // Reference/config objects have no blade view — never fake a link for them.
+  var NO_CRM = { Users: 1, Pipelines: 1, PipelineStages: 1, CustomObjects: 1, Currencies: 1,
+                 Tags: 1, TeamMembers: 1, Teams: 1, Instance: 1 };
+
+  function crmSegment(obj) {
+    if (!obj || NO_CRM[obj]) return null;
+    if (CRM_SEG[obj]) return CRM_SEG[obj];
+    if (/__c$/.test(obj)) return obj;              // custom objects keep their API name
+    return obj.replace(/ies$/, "y").replace(/s$/, "");
+  }
+
+  function crmBase() {
+    var pod = (state.data && state.data.pod) || "na1";
+    return "https://crm." + pod + ".insightly.com";
+  }
+
+  function listUrl(obj) {
+    var seg = crmSegment(obj);
+    return seg ? crmBase() + "/list/" + seg + "/" : null;
+  }
+
+  function recordUrl(obj, id) {
+    var seg = crmSegment(obj);
+    if (!seg || id === null || id === undefined || id === "") return null;
+    return crmBase() + "/list/" + seg + "/?blade=/details/" + seg.toLowerCase() + "/" + id;
+  }
+
+  function link(url, text, extra) {
+    if (!url) return esc(text);
+    return '<a class="rec" data-open="' + esc(url) + '" href="' + esc(url)
+      + '" title="Open in Insightly">' + esc(text) + '</a>'
+      + (extra === false ? "" : '<span class="ext">&#8599;</span>');
+  }
+
+  function openExternal(url) {
+    // Prefer the host bridge: the iframe sandbox normally blocks navigation. Fall back to
+    // window.open where the host permits it.
+    request("ui/open-link", { url: url }).catch(function () {
+      try { window.open(url, "_blank", "noopener"); } catch (e) {}
+    });
+  }
+
   function askInChat(text) {
     return request("ui/message", { role: "user", content: { type: "text", text: text } })
       .catch(function () {});
@@ -292,7 +351,7 @@ ENV_DASHBOARD_HTML = """<!doctype html>
   var NAME_FIELDS = ["RECORD_NAME", "ORGANISATION_NAME", "OPPORTUNITY_NAME", "PROJECT_NAME", "QUOTATION_NAME",
                      "PRODUCT_NAME", "TITLE", "Title", "SUBJECT", "NAME", "TASK_NAME",
                      "MILESTONE_NAME", "TICKET_TITLE"];
-  var state = { data: null, open: null, custom: null };
+  var state = { data: null, open: null, custom: null, pipes: null, stages: null };
 
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
@@ -359,9 +418,10 @@ ENV_DASHBOARD_HTML = """<!doctype html>
   }
 
   // ----------------------------------------------------------------------- detail panel
-  function panel(title, inner, actions) {
+  function panel(title, inner, actions, titleUrl) {
     var el = document.getElementById("panel");
-    el.innerHTML = '<div class="panel"><div class="panel-head"><h2>' + esc(title) + '</h2>'
+    var heading = titleUrl ? link(titleUrl, title) : esc(title);
+    el.innerHTML = '<div class="panel"><div class="panel-head"><h2>' + heading + '</h2>'
       + '<span class="spacer"></span>' + (actions || "")
       + '<button class="ghost" data-close="1">Close</button></div>'
       + '<div class="panel-body" id="pbody">' + inner + '</div></div>';
@@ -382,12 +442,12 @@ ENV_DASHBOARD_HTML = """<!doctype html>
       + '<button data-ask="' + esc(fallbackPrompt) + '" style="margin-top:8px">Ask in chat</button>');
   }
 
-  function recordsTable(items) {
+  function recordsTable(items, obj) {
     if (!items || !items.length) return '<div class="empty-state">No records.</div>';
     var rows = items.slice(0, 25).map(function (r) {
-      var id = idOf(r);
-      return '<tr><td>' + esc(labelOf(r)) + '</td>'
-        + '<td class="num muted">' + esc(id == null ? "" : id) + '</td>'
+      var id = idOf(r), url = recordUrl(obj, id);
+      return '<tr><td>' + link(url, labelOf(r)) + '</td>'
+        + '<td class="num muted">' + link(url, id == null ? "" : String(id), false) + '</td>'
         + '<td class="muted">' + esc((r.DATE_UPDATED_UTC || r.DATE_CREATED_UTC || "").slice(0, 10)) + '</td></tr>';
     }).join("");
     return '<div class="tablewrap"><table><tr><th>Record</th><th>Id</th><th>Updated</th></tr>'
@@ -472,19 +532,136 @@ ENV_DASHBOARD_HTML = """<!doctype html>
       '<button data-ask="Summarise the custom objects in this Insightly environment and what they are used for.">Ask in chat</button>');
   }
 
+  // A custom object's API name (Revenue__c) is not what anyone calls it, so title the
+  // panel with its display label and keep the API name as the subtitle chip.
+  function displayName(obj) {
+    var hit = (state.custom || []).filter(function (c) { return c.name === obj; })[0];
+    return hit ? hit.label : (LABELS[obj] || obj);
+  }
+
+  function pipelinesView(pipes, stages) {
+    var counts = {};
+    (stages || []).forEach(function (st) {
+      counts[st.PIPELINE_ID] = (counts[st.PIPELINE_ID] || 0) + 1;
+    });
+    var rows = (pipes || []).slice().sort(function (a, b) {
+      return String(a.PIPELINE_NAME || "").localeCompare(String(b.PIPELINE_NAME || ""));
+    });
+    if (!rows.length) return '<div class="empty-state">No pipelines.</div>';
+    return '<div class="tablewrap"><table>'
+      + '<tr><th>Pipeline</th><th>Stages</th><th>Used for</th><th>Id</th></tr>'
+      + rows.map(function (p) {
+          var used = p.FOR_OPPORTUNITIES ? "Opportunities" : (p.FOR_PROJECTS ? "Projects" : "—");
+          return '<tr><td>' + esc(p.PIPELINE_NAME) + '</td>'
+            + '<td class="num">' + fmt(counts[p.PIPELINE_ID] || 0) + '</td>'
+            + '<td class="muted">' + esc(used) + '</td>'
+            + '<td class="num muted">' + esc(p.PIPELINE_ID) + '</td></tr>';
+        }).join("") + '</table></div>';
+  }
+
+  // Grouped by parent pipeline, stage number descending inside each group.
+  function stagesView(stages, pipes) {
+    var names = {};
+    (pipes || []).forEach(function (p) { names[p.PIPELINE_ID] = p.PIPELINE_NAME; });
+    var groups = {};
+    (stages || []).forEach(function (st) {
+      var k = st.PIPELINE_ID;
+      (groups[k] = groups[k] || []).push(st);
+    });
+    var keys = Object.keys(groups).sort(function (a, b) {
+      return String(names[a] || a).localeCompare(String(names[b] || b));
+    });
+    if (!keys.length) return '<div class="empty-state">No pipeline stages.</div>';
+    var out = "";
+    keys.forEach(function (k) {
+      var rows = groups[k].slice().sort(function (a, b) {
+        return (b.STAGE_ORDER || 0) - (a.STAGE_ORDER || 0);   // stage number DESC
+      });
+      out += '<div class="section-head" style="margin-top:10px"><h2>'
+        + esc(names[k] || ("Pipeline " + k)) + '</h2><span>' + rows.length + ' stages</span></div>'
+        + '<div class="tablewrap"><table>'
+        + '<tr><th>Pipeline</th><th>Stage no.</th><th>Stage</th><th>Id</th></tr>'
+        + rows.map(function (st) {
+            return '<tr><td class="muted">' + esc(names[k] || k) + '</td>'
+              + '<td class="num">' + fmt(st.STAGE_ORDER) + '</td>'
+              + '<td>' + esc(st.STAGE_NAME) + '</td>'
+              + '<td class="num muted">' + esc(st.STAGE_ID) + '</td></tr>';
+          }).join("") + '</table></div>';
+    });
+    return out;
+  }
+
+  function usersView(items) {
+    if (!items || !items.length) return '<div class="empty-state">No users.</div>';
+    var rows = items.slice().sort(function (a, b) {
+      return String(a.LAST_NAME || "").localeCompare(String(b.LAST_NAME || ""));
+    });
+    return '<div class="tablewrap"><table>'
+      + '<tr><th>User</th><th>Email</th><th>Role</th><th>Active</th></tr>'
+      + rows.map(function (u) {
+          var name = ((u.FIRST_NAME || "") + " " + (u.LAST_NAME || "")).trim() || "(no name)";
+          return '<tr><td>' + esc(name) + '</td>'
+            + '<td class="muted">' + esc(u.EMAIL_ADDRESS || "") + '</td>'
+            + '<td class="muted">' + (u.ACCOUNT_OWNER ? "Account owner" : (u.ADMINISTRATOR ? "Admin" : "User")) + '</td>'
+            + '<td class="muted">' + (u.ACTIVE === false ? "no" : "yes") + '</td></tr>';
+        }).join("") + '</table></div>';
+  }
+
+  function showPipelines() {
+    loading("Pipelines");
+    Promise.all([
+      callTool("app_records", { object: "Pipelines", top: 100 }, "list_records"),
+      callTool("app_records", { object: "PipelineStages", top: 500 }, "list_records")
+    ]).then(function (r) {
+      var pipes = r[0].items || [], stages = r[1].items || [];
+      state.pipes = pipes; state.stages = stages;
+      panel("Pipelines - " + pipes.length, pipelinesView(pipes, stages),
+        '<button data-explore="PipelineStages">Stages</button>');
+    }).catch(function (e) {
+      failed("Pipelines", e, "List the pipelines in this Insightly environment with their stage counts.");
+    });
+  }
+
+  function showStages() {
+    loading("Pipeline stages");
+    Promise.all([
+      callTool("app_records", { object: "PipelineStages", top: 500 }, "list_records"),
+      callTool("app_records", { object: "Pipelines", top: 100 }, "list_records")
+    ]).then(function (r) {
+      var stages = r[0].items || [], pipes = r[1].items || [];
+      panel("Pipeline stages - " + stages.length, stagesView(stages, pipes),
+        '<button data-explore="Pipelines">Pipelines</button>');
+    }).catch(function (e) {
+      failed("Pipeline stages", e, "List the pipeline stages in this Insightly environment, grouped by pipeline.");
+    });
+  }
+
+  function showUsers() {
+    loading("Users");
+    callTool("app_records", { object: "Users", top: 200 }, "list_records")
+      .then(function (r) {
+        var items = r.items || [];
+        panel("Users - " + items.length, usersView(items));
+      })
+      .catch(function (e) { failed("Users", e, "List the users in this Insightly environment with their email addresses."); });
+  }
+
   function showObject(obj) {
+    var title = displayName(obj);
     var actions = '<button data-fields="' + esc(obj) + '">Fields</button>'
-      + '<button data-ask="Summarise the ' + esc(obj) + ' in this Insightly environment and flag anything that looks off.">Ask in chat</button>';
-    loading(obj);
+      + '<button data-ask="Summarise the ' + esc(title) + ' in this Insightly environment and flag anything that looks off.">Ask in chat</button>';
+    loading(title);
     callTool("app_records", { object: obj, top: 25 }, "list_records")
       .then(function (r) {
         var items = r.items || [];
+        var known = state.data && state.data.counts ? state.data.counts[obj] : null;
+        var total = known != null ? known : (r.total != null ? r.total : items.length);
         var head = '<div class="chips" style="margin-bottom:10px"><span class="chip"><b>'
-          + fmt(state.data && state.data.counts ? state.data.counts[obj] : items.length)
-          + '</b> total</span><span class="chip">showing newest ' + items.length + '</span></div>';
-        panel(obj, head + recordsTable(items), actions);
+          + fmt(total) + '</b> total</span><span class="chip">showing newest ' + items.length + '</span>'
+          + (title !== obj ? '<span class="chip">' + esc(obj) + '</span>' : '') + '</div>';
+        panel(title, head + recordsTable(items, obj), actions, listUrl(obj));
       })
-      .catch(function (e) { failed(obj, e, "List the 10 newest " + obj + " in Insightly."); });
+      .catch(function (e) { failed(title, e, "List the 10 newest " + title + " in Insightly."); });
   }
 
   function showFields(obj) {
@@ -500,15 +677,21 @@ ENV_DASHBOARD_HTML = """<!doctype html>
     callTool("app_records", { object: obj, top: 50 }, "list_records")
       .then(function (r) {
         var items = r.items || [];
-        panel(obj, '<div class="chips" style="margin-bottom:10px"><span class="chip"><b>'
-          + items.length + '</b> found</span></div>' + recordsTable(items),
-          '<button data-fields="' + esc(obj) + '">Fields</button>');
+        panel(displayName(obj), '<div class="chips" style="margin-bottom:10px"><span class="chip"><b>'
+          + items.length + '</b> found</span></div>' + recordsTable(items, obj),
+          '<button data-fields="' + esc(obj) + '">Fields</button>', listUrl(obj));
       })
       .catch(function (e) { failed(obj, e, "List the " + obj + " in this Insightly environment."); });
   }
 
   // -------------------------------------------------------------------------- wiring
   document.addEventListener("click", function (e) {
+    var a = e.target.closest("a[data-open]");
+    if (a) {
+      e.preventDefault();
+      openExternal(a.getAttribute("data-open"));
+      return;
+    }
     var t = e.target.closest("button");
     if (!t) return;
     if (t.id === "refresh") {
@@ -522,8 +705,16 @@ ENV_DASHBOARD_HTML = """<!doctype html>
     if (t.dataset.close) { document.getElementById("panel").innerHTML = ""; markOpen(null); return; }
     if (t.dataset.ask) { askInChat(t.dataset.ask); return; }
     if (t.dataset.fields) { showFields(t.dataset.fields); markOpen(t.dataset.fields); return; }
-    if (t.dataset.explore === "CustomObjects") { showCustomObjects(); markOpen(null); return; }
-    if (t.dataset.explore) { showExplore(t.dataset.explore); markOpen(null); return; }
+    if (t.dataset.explore) {
+      var what = t.dataset.explore;
+      markOpen(null);
+      if (what === "CustomObjects") { showCustomObjects(); return; }
+      if (what === "Pipelines") { showPipelines(); return; }
+      if (what === "PipelineStages") { showStages(); return; }
+      if (what === "Users") { showUsers(); return; }
+      showExplore(what);
+      return;
+    }
     if (t.dataset.object) { showObject(t.dataset.object); markOpen(t.dataset.object); return; }
   });
 
