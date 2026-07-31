@@ -55,7 +55,7 @@ No credentials needed at install — you'll be prompted on first use:
 
 ```bash
 claude mcp add insightly \
-  -- uv run --with mcp --with httpx --with pydantic python /Users/luke.wade/Documents/Claude/insightly-mcp/insightly_mcp.py
+  -- uv run --with 'mcp==1.29.0' --with 'httpx<1' --with 'pydantic<3' python /Users/luke.wade/Documents/Claude/insightly-mcp/insightly_mcp.py
 ```
 
 Then ask Claude e.g. *"search Insightly contacts for jane@example.com"* — it'll pop

@@ -39,7 +39,7 @@ git clone https://github.com/lukeswade/insightly-mcp ~/insightly-mcp
 
 # 2. Register it with Claude Code (user scope = available in all your projects)
 claude mcp add --scope user insightly \
-  -- uv run --with mcp --with httpx --with pydantic python ~/insightly-mcp/insightly_mcp.py
+  -- uv run --with 'mcp==1.29.0' --with 'httpx<1' --with 'pydantic<3' python ~/insightly-mcp/insightly_mcp.py
 ```
 
 Restart Claude Code (or start a new session).
@@ -58,7 +58,7 @@ Don't hand-type the paths — let the terminal fill them in. Paste this into
 cat <<EOF
 "insightly": {
   "command": "$(which uv)",
-  "args": ["run", "--with", "mcp", "--with", "httpx", "--with", "pydantic", "python", "$HOME/insightly-mcp/insightly_mcp.py"],
+  "args": ["run", "--with", "mcp==1.29.0", "--with", "httpx<1", "--with", "pydantic<3", "python", "$HOME/insightly-mcp/insightly_mcp.py"],
   "env": { "INSIGHTLY_API_KEY": "PASTE-YOUR-KEY-HERE", "INSIGHTLY_POD": "na1" }
 }
 EOF
@@ -73,7 +73,7 @@ top-level `"mcpServers": { … }` object (create it if it isn't there), and repl
   "mcpServers": {
     "insightly": {
       "command": "/opt/homebrew/bin/uv",
-      "args": ["run", "--with", "mcp", "--with", "httpx", "--with", "pydantic",
+      "args": ["run", "--with", "mcp==1.29.0", "--with", "httpx<1", "--with", "pydantic<3",
                "python", "/Users/jane/insightly-mcp/insightly_mcp.py"],
       "env": { "INSIGHTLY_API_KEY": "your-real-key", "INSIGHTLY_POD": "na1" }
     }

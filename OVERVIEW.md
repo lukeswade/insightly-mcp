@@ -103,7 +103,7 @@ See **[ONBOARDING.md](ONBOARDING.md)** for the 2-minute setup, or just run:
 ```bash
 git clone <repo-url> ~/insightly-mcp
 claude mcp add --scope user insightly \
-  -- uv run --with mcp --with httpx --with pydantic python ~/insightly-mcp/insightly_mcp.py
+  -- uv run --with 'mcp==1.29.0' --with 'httpx<1' --with 'pydantic<3' python ~/insightly-mcp/insightly_mcp.py
 ```
 
 Restart Claude Code, then ask: *"List my Insightly contacts."* It will prompt for
