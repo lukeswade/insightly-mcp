@@ -1,7 +1,7 @@
 # v3.0 — migrating to MCP SDK 2.x (spec 2026-07-28)
 
 **Status:** Spikes 1 & 2 done; port + caching + tasks + **Apps UI** + a full swagger/API-doc
-audit implemented and validated on this branch (**46/46** checks — `spike/validate_v31.py`,
+audit implemented and validated on this branch (**47/47** checks — `spike/validate_v31.py`,
 plus 10 unit tests), **not merged**. See also [API-AUDIT.md](API-AUDIT.md). `main` stays on the pinned
 SDK 1.29.0 (v2.1.4) until the bundle is repinned and install-tested.
 
@@ -150,8 +150,29 @@ What's in the UI:
   error plus an "Ask in chat" button. No Apps support at all → `env_dashboard` returns identical
   numbers with an explanatory note (SEP-2133 requires this).
 
-**Still unverified:** the rendered appearance and the live button round-trip need a real
-Apps-capable host. Everything checkable from outside one is verified — handshake/bridge code
+**ROOT CAUSE FOUND — it does not render in Claude Desktop yet, and it isn't our bug.**
+Installed 3.1.0 in the desktop app and asked for the dashboard: the tool ran, returned correct
+data, and the model narrated it as text. No iframe. Diagnosed by probing the server directly:
+
+| Path | Server advertises `capabilities.extensions` |
+|---|---|
+| legacy `initialize` (2025-06-18) | **absent** |
+| legacy `initialize` (2025-11-25) | **absent** |
+| stateless `server/discover` (2026-07-28) | `{io.modelcontextprotocol/tasks: {}, io.modelcontextprotocol/ui: {}}` |
+
+Per SEP-2133 extensions are negotiated through that `extensions` map, and this SDK only
+exchanges it on the stateless 2026-07-28 protocol. Claude Desktop still uses the legacy
+handshake, so **the host never learns a UI exists** — exactly the same gate that hides our cache
+hints. Corollary worth remembering: `client_supports_apps(ctx)` returns **False** on the legacy
+path *even when the client declares UI support*, so it is a reliable "will it render" signal
+after all — just not for the reason I first assumed.
+
+`env_dashboard` now says so in its own output (`ui: "inline dashboard unavailable: this host
+negotiated 2025-06-18 …"`) instead of returning bare numbers, so nobody debugs a non-problem.
+The UI will light up unchanged when the host adopts stateless MCP.
+
+**Still unverified:** the rendered appearance and the live button round-trip, which need a host
+on the stateless protocol. Everything checkable from outside one is verified — handshake/bridge code
 present, tool `_meta.ui` correct, resource served as `text/html;profile=mcp-app`, app-only
 visibility, and the backing tools returning real data (81 contacts, 72 custom fields on
 Opportunities).

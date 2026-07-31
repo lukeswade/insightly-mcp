@@ -282,8 +282,15 @@ def part4_apps() -> None:
     check("dashboard tool returns real counts",
           isinstance(out.get("counts"), dict) and out["counts"].get("Contacts") == 81,
           f"contacts={out.get('counts', {}).get('Contacts')}")
-    check("degrades for a non-Apps client (note present)", "note" in out,
-          str(out.get("note"))[:80])
+    check("explains why no UI rendered, citing the protocol",
+          "2026-07-28" in str(out.get("ui", "")), str(out.get("ui"))[:120])
+    # Luke's real situation: the client CAN render apps, but the legacy initialize
+    # handshake never advertises the extensions map, so nothing renders.
+    s2 = Server(capabilities={"extensions": {"io.modelcontextprotocol/ui": {}}})
+    out2 = s2.call("env_dashboard")
+    check("same explanation even when the client declares UI support",
+          "2026-07-28" in str(out2.get("ui", "")), str(out2.get("ui"))[:120])
+    s2.close()
     check("dashboard reports the daily quota",
           isinstance(out.get("daily_quota"), dict) and out["daily_quota"].get("remaining") is not None,
           f"quota={out.get('daily_quota')}")

@@ -272,10 +272,17 @@ async def env_dashboard(ctx: Context) -> Any:
     if err:
         return {"error": err}
     snap = await _env_snapshot()
-    # Degrade gracefully: a client without Apps still gets every number, plus a nudge.
+    # Degrade gracefully, and say WHY rather than returning bare numbers. Apps rendering
+    # needs the `extensions` capability map, which this SDK only exchanges on the stateless
+    # 2026-07-28 protocol (via `server/discover`). On the legacy `initialize` handshake
+    # extensions are never negotiated at all — client_supports_apps() is False there even
+    # when the client declares UI support — so nothing can render however capable the host
+    # is. That is a host-version gap, not a misconfiguration, so name it.
     if not client_supports_apps(ctx):
-        snap["note"] = ("this client can't render inline UI, so here are the raw counts "
-                        "(identical to env_summary).")
+        proto = str(getattr(ctx, "protocol_version", "") or "") or "a pre-2026-07-28 revision"
+        snap["ui"] = (f"inline dashboard unavailable: this host negotiated {proto}, and UI "
+                      f"extensions are only advertised on MCP 2026-07-28 (stateless). These "
+                      f"are exactly the numbers env_summary returns — nothing is broken.")
     return snap
 
 
