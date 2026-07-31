@@ -103,6 +103,15 @@ ENV_DASHBOARD_HTML = """<!doctype html>
   .note { margin-top: 12px; font-size: 11.5px; color: var(--muted); }
 </style>
 
+<!-- BISECT PROBE: inline styles only, no CSS variables, no color-mix, no JS. If this
+     line is visible but the rest of the widget is not, the host paints our document and
+     the fault is in our CSS/JS. If even this is invisible, the host is not rendering the
+     document at all and no amount of CSS work will help. -->
+<div style="padding:8px 10px;margin:0 0 12px;border-radius:8px;background:#8b8b8b40;
+            color:#f5f5f5;font:600 13px/1.4 -apple-system,system-ui,sans-serif">
+  Insightly dashboard loaded ✓ <span style="font-weight:400;opacity:.8">(v3.1.3 probe)</span>
+</div>
+
 <header>
   <h1>Insightly environment</h1>
   <span class="pill live" id="env">…</span>
