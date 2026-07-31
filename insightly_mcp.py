@@ -24,16 +24,21 @@ Optional env vars:
 import os
 import json
 import time
+import uuid
 import asyncio
 import pathlib
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
+import mcp_types as types
 from pydantic import BaseModel, Field
 from mcp.server import MCPServer
+from mcp.server.caching import CacheHint
+from mcp.server.extension import Extension, MethodBinding
 from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one has no .elicit
 
-SERVER_VERSION = "3.0.0"
+SERVER_VERSION = "3.1.0"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -42,9 +47,217 @@ PAGE_MAX = 500
 FETCH_ALL_HARD_CAP = 5000
 _MIN_INTERVAL = 0.12  # ~8.3 req/s ceiling, comfortably under the API's 10/s
 
+
+# ------------------------------------------------------------------ background tasks
+# Long jobs (full-object exports, bulk creates) used to be capped so they could
+# finish inside one blocking tool call. They now run as background tasks the client
+# polls, so the caps are gone. Two surfaces over ONE registry:
+#   * plain tools (task_status/task_result/…) — work with every client today;
+#   * the spec's `tasks/*` methods via _TasksExtension — for task-aware clients.
+TASK_TTL_S = 3600           # forget finished tasks after an hour
+TASK_POLL_MS = 1000         # advertised poll interval
+EXPORT_SAFETY_CAP = 100_000  # backstop so a runaway export can't eat all memory
+
+_TASKS: dict[str, dict] = {}
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _task_prune() -> None:
+    cutoff = time.time() - TASK_TTL_S
+    for tid in [t for t, v in _TASKS.items() if v["done_at"] and v["done_at"] < cutoff]:
+        _TASKS.pop(tid, None)
+
+
+def _task_new(kind: str, detail: str) -> dict:
+    _task_prune()
+    tid = uuid.uuid4().hex[:12]
+    rec = {"task_id": tid, "status": "working", "status_message": f"{kind}: starting",
+           "created_at": _now(), "last_updated_at": _now(), "done_at": None,
+           "kind": kind, "detail": detail, "progress": 0, "total": None,
+           "items": None, "summary": None, "error": None,
+           "cancel": False, "_runner": None}
+    _TASKS[tid] = rec
+    return rec
+
+
+def _task_touch(rec: dict, msg: Optional[str] = None, **kw: Any) -> None:
+    rec.update(kw)
+    if msg:
+        rec["status_message"] = msg
+    rec["last_updated_at"] = _now()
+
+
+def _task_finish(rec: dict, status: str, msg: str) -> None:
+    _task_touch(rec, msg, status=status)
+    rec["done_at"] = time.time()
+
+
+def _task_public(rec: dict, include_result: bool = False) -> dict:
+    """The client-facing view (never leaks internals like the runner handle)."""
+    out = {k: rec[k] for k in ("task_id", "status", "status_message", "created_at",
+                               "last_updated_at", "kind", "detail", "progress", "total")}
+    out["poll_interval_ms"] = TASK_POLL_MS
+    if rec["error"]:
+        out["error"] = rec["error"]
+    if rec["summary"]:
+        out["summary"] = rec["summary"]
+    if include_result and rec["items"] is not None:
+        out["result_count"] = len(rec["items"])
+    return out
+
+
+async def _job_export(rec: dict, o: str, brief: bool, updated_after_utc: Optional[str],
+                      max_records: int) -> None:
+    """Page through an entire object with no per-call cap, reporting progress."""
+    cap = min(max(int(max_records), 1), EXPORT_SAFETY_CAP)
+    out: list = []
+    skip = 0
+    # Best-effort total up front so progress means something.
+    _, headers = await _request("GET", f"/{o}", params={"top": 1, "brief": "true",
+                                                        "count_total": "true"}, want_headers=True)
+    try:
+        rec["total"] = int(headers.get("x-total-count")) if headers.get("x-total-count") else None
+    except Exception:
+        rec["total"] = None
+    while len(out) < cap:
+        if rec["cancel"]:
+            _task_finish(rec, "cancelled", f"cancelled after {len(out)} records")
+            rec["items"] = out
+            return
+        page = min(PAGE_MAX, cap - len(out))
+        params: dict = {"top": page, "skip": skip, "brief": str(brief).lower()}
+        if updated_after_utc:
+            params["updated_after_utc"] = updated_after_utc
+        body = await _request("GET", f"/{o}", params=params)
+        if isinstance(body, dict) and body.get("error"):
+            rec["items"] = out
+            rec["error"] = body["error"]
+            _task_finish(rec, "failed", f"API error after {len(out)} records")
+            return
+        batch = body if isinstance(body, list) else []
+        out.extend(batch)
+        _task_touch(rec, f"fetched {len(out)}" + (f" of {rec['total']}" if rec["total"] else ""),
+                    progress=len(out))
+        if len(batch) < page:
+            break
+        skip += len(batch)
+    if brief:
+        _brief_strip(out)
+    rec["items"] = out
+    truncated = len(out) >= cap
+    rec["summary"] = {"object": o, "fetched": len(out), "truncated": truncated}
+    _task_finish(rec, "completed", f"exported {len(out)} records"
+                 + (" (hit safety cap)" if truncated else ""))
+
+
+async def _job_bulk_create(rec: dict, o: str, records: list) -> None:
+    """Create any number of records (no 50-per-call cap), reporting progress."""
+    pk = PK.get(o)
+    ids: list = []
+    errors: list = []
+    rec["total"] = len(records)
+    for i, fields in enumerate(records):
+        if rec["cancel"]:
+            _task_finish(rec, "cancelled", f"cancelled after {len(ids)} created")
+            break
+        if not isinstance(fields, dict):
+            errors.append({"index": i, "error": "not a field dict"})
+            continue
+        res = _write_hint(await _request("POST", f"/{o}", json_body=fields), o)
+        if isinstance(res, dict) and res.get("error"):
+            errors.append({"index": i, "error": res.get("error")})
+        else:
+            ids.append(res.get(pk) if pk and isinstance(res, dict) else None)
+        _task_touch(rec, f"created {len(ids)} of {len(records)}", progress=i + 1)
+    rec["items"] = ids
+    rec["summary"] = {"object": o, "created": len(ids), "failed": len(errors), "errors": errors[:20]}
+    if rec["status"] != "cancelled":
+        _task_finish(rec, "completed" if not errors else "completed",
+                     f"created {len(ids)}, {len(errors)} failed")
+
+
+def _spawn(rec: dict, coro: Any) -> None:
+    """Run a job in the background, keeping a reference so it isn't garbage collected."""
+    async def _guard() -> None:
+        try:
+            await coro
+        except asyncio.CancelledError:
+            _task_finish(rec, "cancelled", "cancelled")
+            raise
+        except Exception as e:  # never let a job take the server down
+            rec["error"] = f"{type(e).__name__}: {e}"
+            _task_finish(rec, "failed", "job raised an exception")
+    rec["_runner"] = asyncio.create_task(_guard())
+
+
+class _TasksExtension(Extension):
+    """Serves the spec's `tasks/*` methods over the same registry the tools use.
+
+    Task-aware clients can poll natively; everyone else uses the task_* tools.
+    """
+
+    identifier = "io.modelcontextprotocol/tasks"
+
+    def methods(self) -> list[MethodBinding]:
+        async def get(ctx: Any, params: Any) -> dict:
+            rec = _TASKS.get(getattr(params, "task_id", None) or "")
+            if not rec:
+                return {"error": "unknown task_id"}
+            return {"taskId": rec["task_id"], "status": rec["status"],
+                    "statusMessage": rec["status_message"], "createdAt": rec["created_at"],
+                    "lastUpdatedAt": rec["last_updated_at"], "pollInterval": TASK_POLL_MS}
+
+        async def result(ctx: Any, params: Any) -> dict:
+            rec = _TASKS.get(getattr(params, "task_id", None) or "")
+            if not rec:
+                return {"error": "unknown task_id"}
+            if rec["status"] == "working":
+                return {"error": "still working", "status": rec["status"]}
+            return {"status": rec["status"], "summary": rec["summary"],
+                    "count": len(rec["items"]) if rec["items"] is not None else 0}
+
+        async def cancel(ctx: Any, params: Any) -> dict:
+            rec = _TASKS.get(getattr(params, "task_id", None) or "")
+            if not rec:
+                return {"error": "unknown task_id"}
+            rec["cancel"] = True
+            return {"taskId": rec["task_id"], "status": "cancelled"}
+
+        async def listing(ctx: Any, params: Any) -> dict:
+            return {"tasks": [_task_public(r) for r in _TASKS.values()]}
+
+        return [
+            MethodBinding("tasks/get", types.GetTaskRequestParams, get),
+            MethodBinding("tasks/result", types.GetTaskPayloadRequestParams, result),
+            MethodBinding("tasks/cancel", types.CancelTaskRequestParams, cancel),
+            MethodBinding("tasks/list", types.ListTasksRequest, listing),
+        ]
+
+
 # Display name shown in Claude's UI. The registration key stays `insightly`
 # (mcpServers key / `claude mcp add insightly`), so tool names are unchanged.
-mcp = MCPServer(name="Insightly SE MCP (internal)", version=SERVER_VERSION)
+#
+# cache_hints: object field metadata is re-fetched constantly and changes rarely, so
+# it is worth caching — but it is per-org (custom fields differ per demo env), hence
+# scope="private", never "public". The tool list only changes when this file does.
+mcp = MCPServer(
+    name="Insightly SE MCP (internal)",
+    version=SERVER_VERSION,
+    extensions=[_TasksExtension()],
+    cache_hints={
+        # Tool/resource inventories only change when this file does.
+        "server/discover": CacheHint(ttl_ms=3_600_000, scope="private"),
+        "tools/list": CacheHint(ttl_ms=3_600_000, scope="private"),
+        "resources/list": CacheHint(ttl_ms=600_000, scope="private"),
+        "resources/templates/list": CacheHint(ttl_ms=600_000, scope="private"),
+        # Field metadata: long enough to kill repeat lookups in a session, short enough
+        # that an SE who just added a custom field sees it on their next question.
+        "resources/read": CacheHint(ttl_ms=300_000, scope="private"),
+    },
+)
 
 # Live credentials for THIS connection (in memory only).
 SESSION: dict = {"api_key": None, "pod": "na1", "name": None}
@@ -113,8 +326,53 @@ class NewKey(BaseModel):
     save: bool = Field(default=False, description="Save this key locally for next time?")
 
 
+def _have_key() -> bool:
+    """True if a key is already available without prompting (session or environment)."""
+    if SESSION.get("api_key"):
+        return True
+    env_key = os.environ.get("INSIGHTLY_API_KEY")
+    if env_key:
+        SESSION.update(api_key=env_key, pod=(os.environ.get("INSIGHTLY_POD") or "na1"), name="env")
+        return True
+    return False
+
+
+_NO_PROMPT_HELP = ("this client can't show input prompts. Set the key without a prompt: "
+                   "set_api_key('<key>', pod='na1'), or add INSIGHTLY_API_KEY to the server's "
+                   "env (the .mcpb extension does this for you).")
+
+
+def _elicit_support(ctx: Context) -> dict:
+    """What kind of prompting this client accepts.
+
+    SDK 2.x advertises elicitation sub-capabilities (form / url) instead of one flag,
+    so we can pick a mode — or bail out with a useful message — instead of firing a
+    request into the void and catching the failure.
+    """
+    caps = getattr(ctx, "client_capabilities", None)
+    el = getattr(caps, "elicitation", None) if caps is not None else None
+    if caps is None:
+        return {"known": False, "any": True, "form": True, "url": False}  # assume yes, try it
+    if el is None:
+        return {"known": True, "any": False, "form": False, "url": False}
+    form = getattr(el, "form", None)
+    url = getattr(el, "url", None)
+    # Sub-capabilities unset means the client declared plain elicitation: treat as form.
+    return {"known": True, "any": True,
+            "form": form is not None or url is None,
+            "url": url is not None}
+
+
 async def _prompt(ctx: Context) -> Optional[str]:
     """Interactively obtain credentials. Returns an error string, or None on success."""
+    support = _elicit_support(ctx)
+    if not support["any"]:
+        return _NO_PROMPT_HELP
+    if not support["form"] and support["url"]:
+        # URL-mode only. We deliberately don't implement it: it would mean hosting a
+        # key-entry page, and an API key should not travel through a web form we serve.
+        return ("this client only supports URL prompts, which this server doesn't use for "
+                "credentials. " + _NO_PROMPT_HELP)
     saved = _load_saved()
     try:
         if saved:
@@ -151,11 +409,7 @@ async def _prompt(ctx: Context) -> Optional[str]:
 
 async def _ensure(ctx: Context) -> Optional[str]:
     """Make sure we have a key: use the session, else an injected env key, else prompt."""
-    if SESSION.get("api_key"):
-        return None
-    env_key = os.environ.get("INSIGHTLY_API_KEY")
-    if env_key:
-        SESSION.update(api_key=env_key, pod=(os.environ.get("INSIGHTLY_POD") or "na1"), name="env")
+    if _have_key():
         return None
     return await _prompt(ctx)
 
@@ -559,11 +813,18 @@ async def describe_object(object: str, ctx: Context) -> Any:
     haven't touched yet. Returns `standard_fields` (from a sample record) and compact
     `custom_fields` (name, label, type, dropdown options, lookup target) so payloads
     use real field names and valid option values. Custom values go in CUSTOMFIELDS:
-    [{"FIELD_NAME": "...__c", "FIELD_VALUE": ...}]."""
+    [{"FIELD_NAME": "...__c", "FIELD_VALUE": ...}].
+
+    The same data is also served as a cacheable resource, `insightly://{object}/fields`,
+    so repeat lookups in a long session don't re-hit the API."""
     err = await _ensure(ctx)
     if err:
         return {"error": err}
-    o = _obj(object)
+    return await _describe(_obj(object))
+
+
+async def _describe(o: str) -> dict:
+    """Build the field reference for an object. Shared by the tool and the resource."""
     out: dict = {"object": o, "pk": PK.get(o)}
     sample = await _request("GET", f"/{o}", params={"top": 1, "brief": "false"})
     if isinstance(sample, list) and sample and isinstance(sample[0], dict):
@@ -579,6 +840,22 @@ async def describe_object(object: str, ctx: Context) -> Any:
     else:
         out["custom_fields"] = []
     return out
+
+
+@mcp.resource("insightly://{object}/fields", mime_type="application/json",
+              name="Insightly object fields",
+              description="Standard + custom field reference for one Insightly object "
+                          "(cacheable; per-connection, since custom fields differ per env).")
+async def object_fields_resource(object: str) -> str:
+    """Cacheable view of describe_object.
+
+    Resources can't prompt for credentials, so this uses whatever key the session or
+    environment already has and says so plainly if there is none.
+    """
+    if not _have_key():
+        return json.dumps({"error": "not connected — run connect() or set_api_key(...) first, "
+                                    "then read this resource again."})
+    return json.dumps(await _describe(_obj(object)), default=str)
 
 @mcp.tool()
 async def create_records(object: str, records: list, ctx: Context) -> Any:
@@ -671,6 +948,93 @@ async def raw_request(method: str, path: str, ctx: Context,
     if err:
         return {"error": err}
     return await _request(method, "/" + path.lstrip("/"), params=query, json_body=body)
+
+
+# ------------------------------------------------------------------------ task tools
+@mcp.tool()
+async def start_export(object: str, ctx: Context, brief: bool = True,
+                       updated_after_utc: Optional[str] = None,
+                       max_records: int = 100000) -> Any:
+    """Export an ENTIRE object in the background — no 5,000-record cap. Returns a
+    task_id immediately; poll with task_status(task_id) and read pages of the result
+    with task_result(task_id). Use this instead of list_records(fetch_all=true) for
+    big environments ("export all 40k contacts")."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    o = _obj(object)
+    rec = _task_new("export", o)
+    _spawn(rec, _job_export(rec, o, brief, updated_after_utc, max_records))
+    return {"task_id": rec["task_id"], "status": rec["status"],
+            "poll_interval_ms": TASK_POLL_MS,
+            "next": f"task_status('{rec['task_id']}') until status=completed, "
+                    f"then task_result('{rec['task_id']}')"}
+
+@mcp.tool()
+async def start_bulk_create(object: str, records: list, ctx: Context) -> Any:
+    """Create ANY number of records in the background — no 50-per-call cap. Returns a
+    task_id immediately; poll with task_status(task_id). Use create_records for small
+    batches you want confirmed inline."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    if not isinstance(records, list) or not records:
+        return {"error": "pass a non-empty list of field dicts."}
+    o = _obj(object)
+    rec = _task_new("bulk_create", f"{o} × {len(records)}")
+    _spawn(rec, _job_bulk_create(rec, o, records))
+    return {"task_id": rec["task_id"], "status": rec["status"], "queued": len(records),
+            "poll_interval_ms": TASK_POLL_MS,
+            "next": f"task_status('{rec['task_id']}')"}
+
+@mcp.tool()
+def task_status(task_id: str) -> Any:
+    """Progress of a background task: status (working/completed/failed/cancelled),
+    progress, total, and a summary once finished."""
+    rec = _TASKS.get(task_id)
+    if not rec:
+        return {"error": f"unknown task_id '{task_id}' (finished tasks are kept for "
+                         f"{TASK_TTL_S // 60} minutes)."}
+    return _task_public(rec, include_result=True)
+
+@mcp.tool()
+def task_result(task_id: str, top: int = 100, skip: int = 0) -> Any:
+    """Read a finished task's records, PAGED (default 100 at a time) — a full export is
+    far too large to return at once. Returns {items, returned, skip, top, has_more,
+    next_skip, count}."""
+    rec = _TASKS.get(task_id)
+    if not rec:
+        return {"error": f"unknown task_id '{task_id}'."}
+    if rec["items"] is None:
+        return {"error": f"no result yet — status is '{rec['status']}'.",
+                "status": rec["status"], "progress": rec["progress"]}
+    items = rec["items"]
+    page = min(max(int(top), 1), PAGE_MAX)
+    start = max(int(skip), 0)
+    window = items[start:start + page]
+    return {"items": window, "returned": len(window), "skip": start, "top": page,
+            "has_more": start + len(window) < len(items),
+            "next_skip": start + len(window), "count": len(items),
+            "status": rec["status"], "summary": rec["summary"]}
+
+@mcp.tool()
+def list_tasks() -> Any:
+    """All background tasks this session knows about, newest first."""
+    _task_prune()
+    return {"tasks": sorted((_task_public(r, include_result=True) for r in _TASKS.values()),
+                            key=lambda r: r["created_at"], reverse=True)}
+
+@mcp.tool()
+def cancel_task(task_id: str) -> Any:
+    """Ask a running task to stop. It stops at the next page/record boundary and keeps
+    whatever it already collected."""
+    rec = _TASKS.get(task_id)
+    if not rec:
+        return {"error": f"unknown task_id '{task_id}'."}
+    if rec["status"] != "working":
+        return {"ok": False, "status": rec["status"], "note": "task is not running."}
+    rec["cancel"] = True
+    return {"ok": True, "status": "cancelling", "task_id": task_id}
 
 
 if __name__ == "__main__":

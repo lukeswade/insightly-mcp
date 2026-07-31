@@ -45,6 +45,18 @@ Switch orgs anytime with `connect` (re-prompts) — handy across your many demo 
 | `add_note(parent_object, parent_id, title, body)` | Attach a note |
 | `raw_request(method, path, query, body)` | Any other endpoint |
 
+**Background jobs (v3.x, SDK 2.x branch)** — long work no longer has to finish inside one call:
+| Tool | Does |
+|------|------|
+| `start_export(object, …)` | Export an entire object in the background — **no 5,000 cap** |
+| `start_bulk_create(object, records)` | Create any number of records — **no 50-per-call cap** |
+| `task_status(task_id)` | Progress: status, progress/total, summary |
+| `task_result(task_id, top, skip)` | Read a finished job's records, paged |
+| `list_tasks()` / `cancel_task(task_id)` | Inventory / stop a running job |
+
+Also exposed as the cacheable resource **`insightly://{object}/fields`** (same data as
+`describe_object`), plus the spec's `tasks/*` methods for task-aware clients.
+
 Built for record-heavy envs: a pooled keep-alive connection (not a fresh client per
 call), client-side rate pacing under the API's 10 req/s limit, and brief-by-default
 listing so responses stay small. The API has **no server-side sort** — `order_by` is

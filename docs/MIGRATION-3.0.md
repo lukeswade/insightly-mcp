@@ -1,6 +1,7 @@
 # v3.0 — migrating to MCP SDK 2.x (spec 2026-07-28)
 
-**Status:** Spike 1 done, code ported on this branch, **not merged**. `main` stays on the pinned
+**Status:** Spikes 1 & 2 done; port + caching + tasks implemented and validated on this
+branch (18/18 checks — `spike/validate_v31.py`), **not merged**. `main` stays on the pinned
 SDK 1.29.0 (v2.1.4) until the bundle is repinned and install-tested.
 
 Everything below marked ✅ was verified by introspecting `mcp==2.0.0` locally on
@@ -72,14 +73,19 @@ stdin right after writing.** Sync tools (`connection_info`) still answer, so it 
 selective failure. Keep stdin open until the response arrives — the 1.x scripts got away with it
 by appending `sleep`. This is a harness artifact, not a server bug.
 
-### Still open (was Spike 2)
-❓ Our key prompt has never worked in **claude.ai web chat**, which is why we inject the key via
-`env`. Two new angles, both unverified:
-- Client capabilities now advertise sub-capabilities — the harness saw
-  `elicitation=ElicitationCapability(form=None, url=None)`, so form vs. URL support is negotiable.
-- `ctx.elicit_url(message, url, elicitation_id)` offers a browser-based flow, and
-  `ctx.input_responses` exposes MRTR answers directly.
-Test against real web chat before promising anything.
+### Spike 2 — DONE (implementation), with one thing only Luke can confirm
+Implemented capability-aware prompting in `_prompt()` via `_elicit_support(ctx)`:
+- client declares **no** elicitation → return actionable guidance immediately
+  (`set_api_key(...)` / `INSIGHTLY_API_KEY`) instead of firing a doomed request and
+  catching the failure. Validated: a no-capability client gets the message, not a crash.
+- client declares **form** (or plain) elicitation → prompt exactly as before. Validated.
+- client declares **url only** → we deliberately refuse. `ctx.elicit_url` would mean hosting a
+  key-entry page and pushing an API key through a web form we serve. Not worth it for credentials.
+
+❓ **Unresolved and untestable from here:** whether claude.ai web chat now satisfies form
+elicitation. The code is ready either way and degrades cleanly. To find out, ask web chat
+*"connect to Insightly"* with no key injected: a prompt means we can drop the `env` workaround;
+the guidance message means keep it.
 
 ## 4. Superseded — original risk analysis (kept for history)
 
@@ -114,7 +120,7 @@ held stream, web chat may now be able to satisfy it. Two things to try:
 - `elicit_url` mode as a browser-based key entry path.
 If either works, the env-injection workaround becomes optional rather than mandatory.
 
-## 5. The payoff (Spike 1 is done — these are next)
+## 5. The payoff — b & c DONE ✅, a (Apps UI) still to do
 
 **a. Apps extension — interactive UI inline.** `mcp.server.apps` provides `Apps`, `Extension`,
 `ToolBinding`, `ResourceBinding`, `ResourceCsp`, `ResourcePermissions`, `Visibility`,
@@ -125,17 +131,36 @@ Highest-value targets, in order:
 3. **Secure key entry form** — an alternative solution to the web-chat gap in Spike 2.
 4. Record tables / seeding confirmation.
 
-**b. Cacheable results.** `CacheHint(ttl_ms, scope)` + `apply_cache_hint` ✅. Note the
-cacheable method set is `{server/discover, resources/read, tools/list, prompts/list,
-resources/list, resources/templates/list}` — **`tools/call` is not cacheable**. Consequence:
-to cache `describe_object` (re-fetched constantly, near-static) we must **re-expose object
-metadata as a resource**, not just a tool. That's a small refactor with a real latency win in
-record-heavy envs.
+**b. Cacheable results — DONE ✅.** `MCPServer` takes a declarative `cache_hints=` mapping, so
+no middleware is needed (the SDK marks middleware "provisional"; avoid it). Implemented:
+- `describe_object`'s payload is now also the resource **`insightly://{object}/fields`**
+  (`tools/call` is NOT cacheable, so the tool alone could never benefit). Both surfaces share
+  one `_describe()`; the tool still prompts for auth, the resource can't prompt and says so.
+- Hints: `tools/list` + `server/discover` 1 h, `resources/list`/`templates/list` 10 min,
+  `resources/read` 5 min — long enough to kill repeat lookups, short enough that an SE who just
+  added a custom field sees it next question. **`scope="private"` always**: custom fields differ
+  per demo env, so a shared cache would leak one env's schema into another.
 
-**c. Tasks extension** (`io.modelcontextprotocol/tasks`, poll-based `tasks/get`). Our
-`FETCH_ALL_HARD_CAP = 5000` and `create_records`' 50-per-call limit exist *because* everything
-must finish inside one blocking call. Tasks removes that constraint: "export all 40k contacts"
-becomes a polled job. Do this last — it changes tool contracts.
+> ⚠️ **Cache hints only reach stateless clients.** They're a 2026-07-28 feature, and 2026-07-28
+> *is* the stateless protocol — no `initialize`. A legacy handshake client negotiates 2025-11-25
+> at best and sees no hints (verified both ways). Claude Desktop today still handshakes, so this
+> is **forward-looking**: correct now, beneficial when Claude adopts the stateless transport.
+> To exercise it, a request's `params._meta` needs `io.modelcontextprotocol/protocolVersion`,
+> `…/clientInfo` **and** `…/clientCapabilities` — omit any and you get a clear -32602.
+
+**c. Tasks — DONE ✅ (caps gone).** There is no batteries-included server-side task manager in
+the SDK, so this is one in-process registry with **two surfaces over it**:
+- **Tools that work with every client today:** `start_export` (whole object, no 5,000 cap —
+  safety backstop 100,000), `start_bulk_create` (no 50-per-call cap), `task_status`,
+  `task_result` (**paged** — a full export is far too big to return at once), `list_tasks`,
+  `cancel_task`.
+- **The spec surface** via `_TasksExtension(Extension)` with `identifier =
+  "io.modelcontextprotocol/tasks"`, serving `tasks/get` / `tasks/result` / `tasks/cancel` /
+  `tasks/list` from the same registry using real `mcp_types` params. Verified `tasks/get` returns
+  a proper task record, so a task-aware client can poll natively.
+Jobs report progress against a real total (from `X-Total-Count`), survive exceptions without
+taking the server down, and stop at the next record boundary when cancelled. `list_records`
+keeps `fetch_all` for small jobs; big work should use `start_export`.
 
 ## 6. Hosting: the strategic unlock (separate project)
 
