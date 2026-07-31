@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "insightly-se-mcp-internal",
   "display_name": "Insightly SE MCP (internal)",
-  "version": "3.1.3",
+  "version": "3.1.4",
   "description": "Drive Insightly demo environments from Claude in plain English \u2014 full read/write, fast paging, and search.",
   "long_description": "Internal Solutions-Engineering tool. Talk to any Insightly demo env in plain English: list/search/create/update/annotate records across every object, with paginated results, an opt-in fetch_all, a real total count, and client-side contains filtering. One-click install: paste your Insightly API key into the secure field below \u2014 no config files, no Terminal JSON editing.",
   "author": {

@@ -16,7 +16,10 @@ button falls back to asking the same question in chat via `ui/message`.
 """
 
 ENV_DASHBOARD_HTML = """<!doctype html>
+<html lang="en">
+<head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>Insightly environment</title>
 <style>
@@ -102,6 +105,8 @@ ENV_DASHBOARD_HTML = """<!doctype html>
   @media (prefers-reduced-motion: reduce) { .skel { animation: none } }
   .note { margin-top: 12px; font-size: 11.5px; color: var(--muted); }
 </style>
+</head>
+<body>
 
 <!-- BISECT PROBE: inline styles only, no CSS variables, no color-mix, no JS. If this
      line is visible but the rest of the widget is not, the host paints our document and
@@ -109,7 +114,7 @@ ENV_DASHBOARD_HTML = """<!doctype html>
      document at all and no amount of CSS work will help. -->
 <div style="padding:8px 10px;margin:0 0 12px;border-radius:8px;background:#8b8b8b40;
             color:#f5f5f5;font:600 13px/1.4 -apple-system,system-ui,sans-serif">
-  Insightly dashboard loaded ✓ <span style="font-weight:400;opacity:.8">(v3.1.3 probe)</span>
+  Insightly dashboard loaded ✓ <span style="font-weight:400;opacity:.8">(v3.1.4 probe)</span>
 </div>
 
 <header>
@@ -446,4 +451,7 @@ ENV_DASHBOARD_HTML = """<!doctype html>
   }
 })();
 </script>
+
+</body>
+</html>
 """
