@@ -30,9 +30,10 @@ from typing import Any, Optional
 
 import httpx
 from pydantic import BaseModel, Field
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server import MCPServer
+from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one has no .elicit
 
-SERVER_VERSION = "2.1.4"
+SERVER_VERSION = "3.0.0"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -43,7 +44,7 @@ _MIN_INTERVAL = 0.12  # ~8.3 req/s ceiling, comfortably under the API's 10/s
 
 # Display name shown in Claude's UI. The registration key stays `insightly`
 # (mcpServers key / `claude mcp add insightly`), so tool names are unchanged.
-mcp = FastMCP("Insightly SE MCP (internal)")
+mcp = MCPServer(name="Insightly SE MCP (internal)", version=SERVER_VERSION)
 
 # Live credentials for THIS connection (in memory only).
 SESSION: dict = {"api_key": None, "pod": "na1", "name": None}
