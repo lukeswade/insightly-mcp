@@ -252,6 +252,32 @@ def part4_apps() -> None:
               f"{len(body)} chars")
         pathlib.Path("/tmp/app_ui_served.html").write_text(body)
 
+    # app-only tools: the buttons' backend, hidden from the model
+    for nm in ("app_records", "app_fields"):
+        t = tools.get(nm, {})
+        vis = ((t.get("_meta") or {}).get("ui") or {}).get("visibility")
+        check(f"{nm} registered app-only", nm in tools and vis == ["app"], f"visibility={vis}")
+    recs = s.call("app_records", {"object": "Contacts", "top": 5})
+    check("app_records drives the drill-in panel",
+          recs.get("returned") == 5 and recs.get("total") == 81,
+          f"returned={recs.get('returned')} total={recs.get('total')}")
+    flds = s.call("app_fields", {"object": "Opportunities"})
+    check("app_fields drives the Fields view",
+          isinstance(flds.get("custom_fields"), list) and flds.get("pk") == "OPPORTUNITY_ID",
+          f"pk={flds.get('pk')} custom={len(flds.get('custom_fields', []))}")
+
+    served = pathlib.Path("/tmp/app_ui_served.html")
+    if served.exists():
+        html = served.read_text()
+        for frag, label in (("ui/initialize", "handshake"),
+                            ("ui/notifications/tool-result", "data notification"),
+                            ('request("tools/call"', "tool bridge"),
+                            ("ui/message", "ask-in-chat bridge"),
+                            ('data-explore="CustomObjects"', "explore buttons"),
+                            ('data-fields=', "fields button"),
+                            ('id="refresh"', "refresh button")):
+            check(f"UI implements the {label}", frag in html)
+
     out = s.call("env_dashboard")
     check("dashboard tool returns real counts",
           isinstance(out.get("counts"), dict) and out["counts"].get("Contacts") == 81,

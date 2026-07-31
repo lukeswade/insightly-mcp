@@ -279,6 +279,46 @@ async def env_dashboard(ctx: Context) -> Any:
     return snap
 
 
+# App-only tools (visibility=["app"]): the dashboard's buttons call these, so the UI never
+# depends on a host being willing to proxy arbitrary model-facing tools. They are hidden
+# from the model, so they add nothing to its tool list.
+@apps.tool(resource_uri="ui://insightly/env-dashboard.html", visibility=["app"],
+           name="app_records",
+           description="(dashboard) newest records for one object, for the drill-in panel.")
+async def app_records(object: str, ctx: Context, top: int = 25,
+                      order_by: Optional[str] = "DATE_UPDATED_UTC desc") -> Any:
+    """Newest records for one object — powers the dashboard drill-in."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    o = _obj(object)
+    page = min(max(int(top), 1), 100)
+    body, hdrs = await _request("GET", f"/{o}",
+                               params={"top": page, "skip": 0, "brief": "true",
+                                       "count_total": "true"}, want_headers=True)
+    if isinstance(body, dict) and body.get("error"):
+        return body
+    items = _brief_strip(body if isinstance(body, list) else [])
+    out = _page_envelope(_apply_sort(items, order_by), 0, page)
+    if hdrs.get("x-total-count") is not None:
+        try:
+            out["total"] = int(hdrs["x-total-count"])
+        except ValueError:
+            pass
+    return out
+
+
+@apps.tool(resource_uri="ui://insightly/env-dashboard.html", visibility=["app"],
+           name="app_fields",
+           description="(dashboard) field reference for one object, for the drill-in panel.")
+async def app_fields(object: str, ctx: Context) -> Any:
+    """Standard + custom fields for one object — powers the dashboard's Fields view."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    return await _describe(_obj(object))
+
+
 # Display name shown in Claude's UI. The registration key stays `insightly`
 # (mcpServers key / `claude mcp add insightly`), so tool names are unchanged.
 #

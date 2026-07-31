@@ -1,7 +1,7 @@
 # v3.0 — migrating to MCP SDK 2.x (spec 2026-07-28)
 
 **Status:** Spikes 1 & 2 done; port + caching + tasks + **Apps UI** + a full swagger/API-doc
-audit implemented and validated on this branch (**35/35** checks — `spike/validate_v31.py`,
+audit implemented and validated on this branch (**46/46** checks — `spike/validate_v31.py`,
 plus 10 unit tests), **not merged**. See also [API-AUDIT.md](API-AUDIT.md). `main` stays on the pinned
 SDK 1.29.0 (v2.1.4) until the bundle is repinned and install-tested.
 
@@ -123,25 +123,38 @@ If either works, the env-injection workaround becomes optional rather than manda
 
 ## 5. The payoff — all three DONE ✅
 
-**a. Apps extension — DONE ✅ (env dashboard).** `apps.add_html_resource()` registers a `ui://`
-document served as `text/html;profile=mcp-app`; `@apps.tool(resource_uri=…)` stamps
-`_meta.ui.resourceUri` on a tool so the host renders it inline. Implemented `env_dashboard`
-(stat tiles per object, proportional bars, remaining daily API quota) with the HTML in
-[`app_ui.py`](../app_ui.py).
+**a. Apps extension — DONE ✅ (interactive env dashboard).** Built against the real ext-apps
+contract (SEP-1865) rather than guesswork: JSON-RPC 2.0 over `postMessage`, with
+`ui/initialize` → `ui/notifications/initialized` handshake, data arriving as
+`ui/notifications/tool-result`, buttons calling `tools/call`, and "Ask in chat" using
+`ui/message`. HTML lives in [`app_ui.py`](../app_ui.py).
 
-**Two hard-won gotchas:**
-- **Apps contributions are collected when `MCPServer` is constructed.** A `@apps.tool` defined
-  *after* the constructor is silently ignored — the resource registered, the tool simply never
-  appeared. Declare app tools above the constructor.
-- **Data delivery to the iframe is the host's half of the contract** and isn't in the SDK, so the
-  page accepts the payload from several plausible channels (injected global or `postMessage`) and
-  shows a clear waiting state otherwise. **The visual result is unverified** — it needs a real
-  Apps-capable host. Server side is fully verified: tool registered with the right `_meta.ui`,
-  resource served with the right MIME type, and `client_supports_apps(ctx)` degradation returning
-  identical numbers plus an explanatory note (SEP-2133 requires this).
+What's in the UI:
+- **Header**: env name, pod, remaining daily API quota, and a **Refresh** button.
+- **Stat tiles** per object (tabular numerals, proportional bars) — each one **clickable**,
+  opening a drill-in panel with the newest 25 records and a **Fields** button.
+- **Fields view**: custom fields as a table (label, type, and the *accepted values* for
+  dropdowns / the lookup target) plus standard fields as chips — this is the thing that stops
+  the model inventing field names.
+- **Explore row**: Custom objects · Pipelines · Stages · Users · Tags · Currencies.
+- **Ask in chat** on every panel, which pushes a matching prompt into the conversation.
+- Host theming adopted from `hostContext.theme` and `styles.variables`, skeleton loading
+  states, keyboard focus rings, `prefers-reduced-motion` respected.
 
-Still to do: the **env picker** and a **key-entry form** both need the host's tool-call bridge
-from inside the iframe — worth doing once the dashboard is confirmed rendering.
+**Two design decisions worth keeping:**
+- **App-only tools.** A host may only let an app call *its own* tools, so the buttons are backed
+  by `app_records` / `app_fields` registered with `visibility=["app"]` — callable from the UI,
+  invisible to the model, so they add nothing to its tool list. Each call still falls back to the
+  public tool, then to asking in chat, so no button is ever a dead end.
+- **Everything degrades.** No host bridge → a clear waiting state. Refused `tools/call` → the
+  error plus an "Ask in chat" button. No Apps support at all → `env_dashboard` returns identical
+  numbers with an explanatory note (SEP-2133 requires this).
+
+**Still unverified:** the rendered appearance and the live button round-trip need a real
+Apps-capable host. Everything checkable from outside one is verified — handshake/bridge code
+present, tool `_meta.ui` correct, resource served as `text/html;profile=mcp-app`, app-only
+visibility, and the backing tools returning real data (81 contacts, 72 custom fields on
+Opportunities).
 
 **b. Cacheable results — DONE ✅.** `MCPServer` takes a declarative `cache_hints=` mapping, so
 no middleware is needed (the SDK marks middleware "provisional"; avoid it). Implemented:
