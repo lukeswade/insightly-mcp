@@ -19,13 +19,22 @@ if [ "$VER" != "$MVER" ]; then
 fi
 echo "Version: $VER"
 
-# Keep a single source of truth: copy the canonical server into the bundle.
+# Keep a single source of truth: copy the canonical server (and its UI module — the
+# server imports app_ui, so omitting it makes the bundle die on import) into the bundle.
 mkdir -p "$HERE/server" "$ROOT/dist"
 cp "$ROOT/insightly_mcp.py" "$HERE/server/insightly_mcp.py"
+[ -f "$ROOT/app_ui.py" ] && cp "$ROOT/app_ui.py" "$HERE/server/app_ui.py"
 
 MCPB=(npx -y @anthropic-ai/mcpb)
+# MCPB_SUFFIX builds a side-by-side artifact and does NOT move the -latest alias, so a
+# pre-release can be install-tested without changing what colleagues download.
+OUT="$ROOT/dist/insightly-se-mcp-$VER${MCPB_SUFFIX:-}.mcpb"
 "${MCPB[@]}" validate "$HERE/manifest.json"
-"${MCPB[@]}" pack "$HERE" "$ROOT/dist/insightly-se-mcp-$VER.mcpb"
-# Stable alias so shared links (docs, the internal artifact page) never go stale.
-cp "$ROOT/dist/insightly-se-mcp-$VER.mcpb" "$ROOT/dist/insightly-se-mcp-latest.mcpb"
-echo "Built dist/insightly-se-mcp-$VER.mcpb (+ dist/insightly-se-mcp-latest.mcpb alias)"
+"${MCPB[@]}" pack "$HERE" "$OUT"
+if [ -z "${MCPB_SUFFIX:-}" ]; then
+  # Stable alias so shared links (docs, the internal artifact page) never go stale.
+  cp "$OUT" "$ROOT/dist/insightly-se-mcp-latest.mcpb"
+  echo "Built $(basename "$OUT") (+ insightly-se-mcp-latest.mcpb alias)"
+else
+  echo "Built $(basename "$OUT") — the -latest alias was left untouched."
+fi
