@@ -263,6 +263,12 @@ def part4_apps() -> None:
         t = tools.get(nm, {})
         vis = ((t.get("_meta") or {}).get("ui") or {}).get("visibility")
         check(f"{nm} registered app-only", nm in tools and vis == ["app"], f"visibility={vis}")
+    co = s.call("app_custom_objects", {})
+    rows = co.get("custom_objects") or []
+    check("app_custom_objects returns definitions with labels + counts",
+          co.get("total", 0) >= 10 and rows and rows[0].get("label") and rows[0].get("name", "").endswith("__c")
+          and isinstance(rows[0].get("count"), int),
+          f"total={co.get('total')} top={rows[0].get('label') if rows else None}={rows[0].get('count') if rows else None}")
     recs = s.call("app_records", {"object": "Contacts", "top": 5})
     check("app_records drives the drill-in panel",
           recs.get("returned") == 5 and recs.get("total") == 81,
@@ -275,13 +281,18 @@ def part4_apps() -> None:
     served = pathlib.Path("/tmp/app_ui_served.html")
     if served.exists():
         html = served.read_text()
+        check("the bisect probe is gone from the shipped widget", "BISECT PROBE" not in html)
+        check("no document.write embedding hazards remain",
+              "\\" not in html.replace("\\n", "") and "`" not in html)
         for frag, label in (("ui/initialize", "handshake"),
                             ("ui/notifications/tool-result", "data notification"),
                             ('request("tools/call"', "tool bridge"),
                             ("ui/message", "ask-in-chat bridge"),
                             ('data-explore="CustomObjects"', "explore buttons"),
                             ('data-fields=', "fields button"),
-                            ('id="refresh"', "refresh button")):
+                            ('id="refresh"', "refresh button"),
+                            ("ui/notifications/size-changed", "dynamic height reporting"),
+                            ('id="custom"', "custom-objects section")):
             check(f"UI implements the {label}", frag in html)
 
     out = s.call("env_dashboard")

@@ -45,9 +45,9 @@ ENV_DASHBOARD_HTML = """<!doctype html>
      schemes so the browser picks the right one, and paint an opaque surface rather than
      sitting transparent over an unknown background (dark ink on a dark host = "blank"). */
   html { color-scheme: light dark; }
-  /* Guarantee a non-zero height at first paint: a zero-height iframe is invisible even
-     when everything else is correct. */
-  body { margin: 0; padding: 14px; min-height: 140px; background: var(--bg); color: var(--ink);
+  /* Non-zero height at first paint (a zero-height iframe is invisible), but only a
+     floor — real height is reported to the host by the ResizeObserver below. */
+  body { margin: 0; padding: 14px; min-height: 96px; background: var(--bg); color: var(--ink);
          font: 14px/1.5 var(--font-family, "Avenir Next", -apple-system, system-ui, sans-serif); }
 
   header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
@@ -106,18 +106,18 @@ ENV_DASHBOARD_HTML = """<!doctype html>
   @keyframes pulse { 0%,100% { opacity: .45 } 50% { opacity: .9 } }
   @media (prefers-reduced-motion: reduce) { .skel { animation: none } }
   .note { margin-top: 12px; font-size: 11.5px; color: var(--muted); }
+  .section { margin-top: 14px; }
+  .section-head { display: flex; align-items: baseline; gap: 8px; margin: 0 0 8px; }
+  .section-head h2 { margin: 0; font-size: 11px; font-weight: 600; letter-spacing: .08em;
+                     text-transform: uppercase; color: var(--accent); }
+  .section-head span { font-size: 11.5px; color: var(--muted); }
+  .tile.custom .k { color: var(--ink); font-weight: 500; }
+  .tile.custom .api { font-size: 10.5px; color: var(--muted); margin-top: 2px;
+                      font-family: ui-monospace, Menlo, monospace;
+                      white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 </style>
 </head>
 <body>
-
-<!-- BISECT PROBE: inline styles only, no CSS variables, no color-mix, no JS. If this
-     line is visible but the rest of the widget is not, the host paints our document and
-     the fault is in our CSS/JS. If even this is invisible, the host is not rendering the
-     document at all and no amount of CSS work will help. -->
-<div style="padding:8px 10px;margin:0 0 12px;border-radius:8px;background:#8b8b8b40;
-            color:#f5f5f5;font:600 13px/1.4 -apple-system,system-ui,sans-serif">
-  Insightly dashboard loaded ✓ <span style="font-weight:400;opacity:.8">(v3.1.7 probe)</span>
-</div>
 
 <header>
   <h1>Insightly environment</h1>
@@ -139,6 +139,7 @@ ENV_DASHBOARD_HTML = """<!doctype html>
 </div>
 
 <div id="body"><div class="wait">Waiting for environment data…</div></div>
+<div id="custom"></div>
 <div id="panel"></div>
 
 <script>
@@ -164,6 +165,24 @@ ENV_DASHBOARD_HTML = """<!doctype html>
   function notify(method, params) {
     post({ jsonrpc: "2.0", method: method, params: params || {} });
   }
+
+  // Dynamic height. Implementing the raw protocol means we own the size notifications
+  // the SDK would otherwise send, so watch the document and tell the host whenever our
+  // content grows or shrinks (opening a drill-in panel, loading custom objects...).
+  var lastH = 0;
+  function reportSize() {
+    var h = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
+    if (!h || Math.abs(h - lastH) < 2) return;
+    lastH = h;
+    notify("ui/notifications/size-changed", { width: document.documentElement.clientWidth, height: h });
+  }
+  if (typeof ResizeObserver === "function") {
+    var ro = new ResizeObserver(function () { reportSize(); });
+    ro.observe(document.documentElement);
+    ro.observe(document.body);
+  }
+  window.addEventListener("load", reportSize);
+  setInterval(reportSize, 1000);   // cheap backstop for late layout shifts
 
   window.addEventListener("message", function (e) {
     var m = e.data;
@@ -270,10 +289,10 @@ ENV_DASHBOARD_HTML = """<!doctype html>
     Events: "Events", Notes: "Notes", Emails: "Emails", Ticket: "Tickets",
     Product: "Products", KnowledgeArticle: "KB articles", Users: "Users"
   };
-  var NAME_FIELDS = ["ORGANISATION_NAME", "OPPORTUNITY_NAME", "PROJECT_NAME", "QUOTATION_NAME",
+  var NAME_FIELDS = ["RECORD_NAME", "ORGANISATION_NAME", "OPPORTUNITY_NAME", "PROJECT_NAME", "QUOTATION_NAME",
                      "PRODUCT_NAME", "TITLE", "Title", "SUBJECT", "NAME", "TASK_NAME",
                      "MILESTONE_NAME", "TICKET_TITLE"];
-  var state = { data: null, open: null };
+  var state = { data: null, open: null, custom: null };
 
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
@@ -291,7 +310,11 @@ ENV_DASHBOARD_HTML = """<!doctype html>
     }
     var first = rec.FIRST_NAME || "", last = rec.LAST_NAME || "";
     if (first || last) return (first + " " + last).trim();
-    return rec.EMAIL_ADDRESS || "(no name)";
+    if (rec.EMAIL_ADDRESS) return rec.EMAIL_ADDRESS;
+    // Custom objects name their field after themselves (e.g. Crew_Name__c), so fall back
+    // to any *_NAME / *NAME__c key before giving up.
+    var k = Object.keys(rec).filter(function (x) { return /NAME/i.test(x) && rec[x]; });
+    return k.length ? rec[k[0]] : "(no name)";
   }
 
   function idOf(rec) {
@@ -331,6 +354,8 @@ ENV_DASHBOARD_HTML = """<!doctype html>
     }
     html += '<div class="note">Click any tile to look inside — newest records, or its full field list.</div>';
     document.getElementById("body").innerHTML = html;
+    reportSize();
+    if (state.custom === null) { state.custom = []; loadCustomObjects(); }
   }
 
   // ----------------------------------------------------------------------- detail panel
@@ -341,6 +366,7 @@ ENV_DASHBOARD_HTML = """<!doctype html>
       + '<button class="ghost" data-close="1">Close</button></div>'
       + '<div class="panel-body" id="pbody">' + inner + '</div></div>';
     el.scrollIntoView({ block: "nearest" });
+    reportSize();
   }
 
   function loading(title) {
@@ -389,6 +415,61 @@ ENV_DASHBOARD_HTML = """<!doctype html>
         + std.map(function (f) { return '<span class="chip">' + esc(f) + '</span>'; }).join("") + '</div>';
     }
     return out;
+  }
+
+  function customObjectsGrid(rows) {
+    if (!rows || !rows.length) return "";
+    var max = Math.max.apply(null, rows.map(function (r) { return r.count || 0; }).concat([1]));
+    return '<div class="section"><div class="section-head"><h2>Custom objects</h2>'
+      + '<span>' + rows.length + ' defined in this environment</span></div><div class="grid">'
+      + rows.map(function (r) {
+          var n = r.count, has = typeof n === "number" && n > 0;
+          var w = has ? Math.max(3, Math.round((n / max) * 100)) : 0;
+          return '<button class="tile custom' + (has ? '' : ' empty') + '"'
+            + ' data-object="' + esc(r.name) + '" aria-pressed="false"'
+            + ' title="' + esc(r.label) + ' (' + esc(r.name) + ')">'
+            + '<div class="n">' + fmt(n) + '</div>'
+            + '<div class="k">' + esc(r.label) + '</div>'
+            + '<div class="api">' + esc(r.name) + '</div>'
+            + (has ? '<div class="bar" style="width:' + w + '%"></div>' : '')
+            + '</button>';
+        }).join("") + '</div></div>';
+  }
+
+  function loadCustomObjects() {
+    callTool("app_custom_objects", {})
+      .then(function (r) {
+        state.custom = r.custom_objects || [];
+        document.getElementById("custom").innerHTML = customObjectsGrid(state.custom);
+        reportSize();
+      })
+      .catch(function () { /* core dashboard still stands on its own */ });
+  }
+
+  // /CustomObjects returns DEFINITIONS, not records — so render them as what they are.
+  function showCustomObjects() {
+    var rows = state.custom;
+    if (!rows || !rows.length) {
+      loading("Custom objects");
+      callTool("app_custom_objects", {}).then(function (r) {
+        state.custom = r.custom_objects || [];
+        showCustomObjects();
+      }).catch(function (e) {
+        failed("Custom objects", e, "List the custom objects in this Insightly environment.");
+      });
+      return;
+    }
+    var body = '<div class="tablewrap"><table>'
+      + '<tr><th>Custom object</th><th>API name</th><th>Records</th><th>Nav bar</th></tr>'
+      + rows.map(function (r) {
+          return '<tr><td>' + esc(r.label) + '</td>'
+            + '<td class="muted">' + esc(r.name) + '</td>'
+            + '<td class="num">' + fmt(r.count) + '</td>'
+            + '<td class="muted">' + (r.in_navbar ? "yes" : "—") + '</td></tr>';
+        }).join("") + '</table></div>'
+      + '<div class="note">Click a custom-object card above to browse its records.</div>';
+    panel("Custom objects · " + rows.length, body,
+      '<button data-ask="Summarise the custom objects in this Insightly environment and what they are used for.">Ask in chat</button>');
   }
 
   function showObject(obj) {
@@ -441,6 +522,7 @@ ENV_DASHBOARD_HTML = """<!doctype html>
     if (t.dataset.close) { document.getElementById("panel").innerHTML = ""; markOpen(null); return; }
     if (t.dataset.ask) { askInChat(t.dataset.ask); return; }
     if (t.dataset.fields) { showFields(t.dataset.fields); markOpen(t.dataset.fields); return; }
+    if (t.dataset.explore === "CustomObjects") { showCustomObjects(); markOpen(null); return; }
     if (t.dataset.explore) { showExplore(t.dataset.explore); markOpen(null); return; }
     if (t.dataset.object) { showObject(t.dataset.object); markOpen(t.dataset.object); return; }
   });

@@ -41,7 +41,7 @@ from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one 
 
 from app_ui import ENV_DASHBOARD_HTML
 
-SERVER_VERSION = "3.1.7"
+SERVER_VERSION = "3.1.8"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -326,6 +326,45 @@ async def app_records(object: str, ctx: Context, top: int = 25,
         except ValueError:
             pass
     return out
+
+
+@apps.tool(resource_uri="ui://insightly/env-dashboard.html", visibility=["app"],
+           name="app_custom_objects",
+           description="(dashboard) this environment's custom objects with record counts.")
+async def app_custom_objects(ctx: Context, with_counts: bool = True) -> Any:
+    """Custom object definitions + how many records each holds.
+
+    /CustomObjects returns definitions (OBJECT_NAME, SINGULAR_LABEL, PLURAL_LABEL), not
+    records — so counts come from the generic /{objectName} endpoint, one cheap
+    count_total call each.
+    """
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    defs = await _request("GET", "/CustomObjects", params={"top": 200})
+    if isinstance(defs, dict) and defs.get("error"):
+        return defs
+    out: list = []
+    for d in (defs if isinstance(defs, list) else []):
+        if not isinstance(d, dict):
+            continue
+        api = d.get("OBJECT_NAME")
+        row = {"name": api,
+               "label": d.get("PLURAL_LABEL") or d.get("SINGULAR_LABEL") or api,
+               "singular": d.get("SINGULAR_LABEL"),
+               "in_navbar": d.get("ENABLE_NAVBAR")}
+        if with_counts and api:
+            _, hdrs = await _request("GET", f"/{api}",
+                                     params={"top": 1, "brief": "true", "count_total": "true"},
+                                     want_headers=True)
+            tot = hdrs.get("x-total-count")
+            try:
+                row["count"] = int(tot) if tot is not None else None
+            except (TypeError, ValueError):
+                row["count"] = None
+        out.append(row)
+    out.sort(key=lambda r: (r.get("count") is None, -(r.get("count") or 0)))
+    return {"custom_objects": out, "total": len(out)}
 
 
 @apps.tool(resource_uri="ui://insightly/env-dashboard.html", visibility=["app"],
