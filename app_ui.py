@@ -66,6 +66,9 @@ ENV_DASHBOARD_HTML = """<!doctype html>
   button:disabled { opacity: .5; cursor: default; }
   button.ghost { background: transparent; }
   .toolbar { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+  /* An author display rule beats the UA sheet's [hidden], so restate it — otherwise the
+     Explore bar shows before there is anything to explore. */
+  .toolbar[hidden] { display: none; }
   .toolbar .lbl { font-size: 11px; font-weight: 600; letter-spacing: .08em; color: var(--muted);
                   text-transform: uppercase; align-self: center; margin-right: 2px; }
 
@@ -308,11 +311,19 @@ ENV_DASHBOARD_HTML = """<!doctype html>
     setTimeout(function () {
       if (state.data) return;
       callTool("env_dashboard", {})
-        .then(function (d) { if (d && d.counts) render(d); })
-        .catch(function () {
+        .then(function (d) { render(d); })
+        .catch(function (e) {
+          // Only speak up if there is still nothing on screen. A late tool-result may have
+          // painted the dashboard while this request was in flight, and a bug inside
+          // render() must not be reported to the user as "the host sent no data" — say
+          // what actually went wrong instead, so the next failure is diagnosable.
+          if (state.rendered) return;
+          console.error("[insightly] dashboard data failed", e);
           document.getElementById("body").innerHTML =
-            '<div class="wait">The dashboard loaded but the host sent no data, and it '
-            + 'could not let this panel fetch it. The counts are in the message below.</div>';
+            '<div class="err">The dashboard could not load its data: '
+            + esc((e && e.message) || e) + '</div>'
+            + '<div class="wait">The counts are in the message below. Try Refresh, '
+            + 'or ask in chat.</div>';
         });
     }, 2500);
   }
@@ -410,7 +421,7 @@ ENV_DASHBOARD_HTML = """<!doctype html>
                      "MILESTONE_NAME", "TICKET_TITLE"];
   var state = { data: null, open: null, custom: null, pipes: null, stages: null,
                envs: null, activeEnv: null, addOpen: false, menuOpen: false,
-               renaming: null, removing: null };
+               renaming: null, removing: null, rendered: false };
 
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
@@ -443,7 +454,11 @@ ENV_DASHBOARD_HTML = """<!doctype html>
   function render(d) {
     if (!d || !d.counts) return;
     state.data = d;
-    document.getElementById("env").textContent = d.connected_as || "connected";
+    // The environment name lives in the header tag (which is also the picker), not in a
+    // separate pill. Keep an explicitly-chosen name; only fall back to what the server
+    // reports it connected as.
+    if (!state.activeEnv) state.activeEnv = d.connected_as;
+    envTag();
     document.getElementById("pod").textContent = "pod " + (d.pod || "?");
     var q = document.getElementById("quota");
     if (d.daily_quota && d.daily_quota.remaining != null) {
@@ -476,6 +491,7 @@ ENV_DASHBOARD_HTML = """<!doctype html>
     if (state.envs === null) { state.envs = []; state.activeEnv = d.connected_as; loadEnvs(false); }
     else { envTag(); }
     if (state.custom === null) { state.custom = []; loadCustomObjects(); }
+    state.rendered = true;   // set LAST: proof the dashboard actually painted, not just that data arrived
   }
 
   // ----------------------------------------------------------------------- detail panel

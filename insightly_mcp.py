@@ -41,7 +41,7 @@ from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one 
 
 from app_ui import ENV_DASHBOARD_HTML
 
-SERVER_VERSION = "3.5.0"
+SERVER_VERSION = "3.5.1"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -574,9 +574,23 @@ def _have_key() -> bool:
         return True
     env_key = os.environ.get("INSIGHTLY_API_KEY")
     if env_key:
-        SESSION.update(api_key=env_key, pod=(os.environ.get("INSIGHTLY_POD") or "na1"), name="env")
+        SESSION.update(api_key=env_key, pod=(os.environ.get("INSIGHTLY_POD") or "na1"),
+                       name=_env_key_label(env_key))
         return True
     return False
+
+
+def _env_key_label(env_key: str) -> str:
+    """What to call the key the desktop extension injects.
+
+    If it is one we already have saved, use that name — then the header and the picker
+    agree, and the active row gets its tick. Otherwise say where it came from rather than
+    the literal "env", which reads as a placeholder in the UI.
+    """
+    for name, rec in _load_saved().items():
+        if rec.get("api_key") == env_key:
+            return name
+    return "Extension key"
 
 
 def _no_prompt_help() -> str:
@@ -919,7 +933,7 @@ def connection_info() -> dict:
     least one API call has been made in this session — it is read from responses, not polled."""
     env_key = os.environ.get("INSIGHTLY_API_KEY")
     key = SESSION.get("api_key") or env_key
-    name = SESSION.get("name") or ("env" if env_key else None)
+    name = SESSION.get("name") or (_env_key_label(env_key) if env_key else None)
     pod = SESSION.get("pod") or os.environ.get("INSIGHTLY_POD") or "na1"
     out = {"connected": bool(key), "as": name, "pod": pod,
            "read_only": READONLY, "version": SERVER_VERSION}

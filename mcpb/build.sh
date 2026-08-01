@@ -82,6 +82,17 @@ if any(bad.values()):
     print(f"ERROR: widget HTML contains embedding hazards: {bad}", file=sys.stderr)
     raise SystemExit(1)
 print("widget HTML is free of document.write embedding hazards")
+
+# getElementById on an id the markup no longer has returns null, and the TypeError kills
+# the rest of the function it was called from — in render() that means a permanently
+# half-drawn dashboard. Rename an element and this catches the stragglers.
+declared = set(re.findall(r'id="([A-Za-z][\w-]*)"', html))
+used = set(re.findall(r'getElementById\("([^"]+)"\)', html))
+missing = sorted(used - declared)
+if missing:
+    print(f"ERROR: widget script reads ids that do not exist: {missing}", file=sys.stderr)
+    raise SystemExit(1)
+print(f"widget element references all resolve ({len(used)} ids)")
 PYUI
 
 MCPB=(npx -y @anthropic-ai/mcpb)
