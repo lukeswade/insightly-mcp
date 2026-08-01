@@ -41,7 +41,7 @@ from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one 
 
 from app_ui import ENV_DASHBOARD_HTML
 
-SERVER_VERSION = "3.2.1"
+SERVER_VERSION = "3.3.0"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -493,9 +493,20 @@ def _have_key() -> bool:
     return False
 
 
-_NO_PROMPT_HELP = ("this client can't show input prompts. Set the key without a prompt: "
-                   "set_api_key('<key>', pod='na1'), or add INSIGHTLY_API_KEY to the server's "
-                   "env (the .mcpb extension does this for you).")
+def _no_prompt_help() -> str:
+    """Guidance for clients that cannot show the interactive picker (e.g. desktop chat).
+
+    If environments are already saved, switching needs no key at all — say so, because
+    otherwise the only apparent option is pasting a secret into the conversation.
+    """
+    names = sorted(_load_saved().keys())
+    if names:
+        return ("this client can't show the interactive picker, but you don't need it: switch "
+                "with use_saved('<name>') and the key is read from the local key store, never "
+                f"typed into the chat. Saved environments: {', '.join(names)}.")
+    return ("this client can't show input prompts, and there are no saved environments yet. "
+            "Use set_api_key('<key>', pod='na1', friendly_name='demo1', save=true) once; after "
+            "that you can switch with use_saved('demo1').")
 
 
 def _elicit_support(ctx: Context) -> dict:
@@ -523,12 +534,12 @@ async def _prompt(ctx: Context) -> Optional[str]:
     """Interactively obtain credentials. Returns an error string, or None on success."""
     support = _elicit_support(ctx)
     if not support["any"]:
-        return _NO_PROMPT_HELP
+        return _no_prompt_help()
     if not support["form"] and support["url"]:
         # URL-mode only. We deliberately don't implement it: it would mean hosting a
         # key-entry page, and an API key should not travel through a web form we serve.
         return ("this client only supports URL prompts, which this server doesn't use for "
-                "credentials. " + _NO_PROMPT_HELP)
+                "credentials. " + _no_prompt_help())
     saved = _load_saved()
     try:
         if saved:
@@ -666,6 +677,12 @@ def _page_envelope(items: list, skip: int, top: int) -> dict:
     returned = len(items) if isinstance(items, list) else 0
     return {"items": items, "returned": returned, "skip": skip, "top": top,
             "has_more": returned == top, "next_skip": skip + returned}
+
+
+def _CLIENT_ID_RESET() -> None:
+    """Invalidate the pooled client so the next call rebuilds it for the new key/pod."""
+    global _CLIENT_ID
+    _CLIENT_ID = (None, None)
 
 
 # One pooled client per (pod, key) so we reuse the TLS/keep-alive connection across
@@ -832,12 +849,47 @@ def disconnect() -> dict:
     return {"ok": True}
 
 @mcp.tool()
+async def use_saved(name: str, ctx: Context) -> dict:
+    """Switch to a saved environment BY NAME — the way to change envs in any client.
+
+    The key is read from the local key store, so it never appears in the conversation.
+    Use list_saved() to see the names. Example: use_saved('demo1').
+    """
+    saved = _load_saved()
+    if not saved:
+        return {"connected": False,
+                "error": "no saved environments yet. Connect once with set_api_key(key, pod, "
+                         "friendly_name='demo1', save=true) and it will be reusable by name."}
+    entry = saved.get(name)
+    if entry is None:
+        # Be forgiving about case/spacing before giving up.
+        match = [k for k in saved if k.strip().lower() == (name or "").strip().lower()]
+        if match:
+            entry = saved[match[0]]
+            name = match[0]
+    if entry is None:
+        return {"connected": False,
+                "error": f"no saved environment called '{name}'.",
+                "available": sorted(saved.keys())}
+    SESSION.update(api_key=entry["api_key"], pod=entry.get("pod", "na1"), name=name)
+    _CLIENT_ID_RESET()
+    chk = await _request("GET", "/Contacts", params={"top": 1, "brief": "true"})
+    if isinstance(chk, dict) and chk.get("error"):
+        return {"connected": False, "as": name, "pod": SESSION.get("pod"),
+                "error": f"switched to '{name}' but the key was rejected: {chk['error']}"}
+    return {"connected": True, "as": name, "pod": SESSION.get("pod"),
+            "note": f"now using the '{name}' environment."}
+
+
+@mcp.tool()
 def list_saved() -> dict:
-    """List locally-saved keys (names + pod + masked key). Keys are never shown in full."""
+    """List locally-saved environments (names + pod + masked key). Keys are never shown in
+    full — switch to one with use_saved('<name>'), which never puts the key in the chat."""
     s = _load_saved()
     return {"active": SESSION.get("name"),
             "saved": [{"name": n, "pod": v.get("pod", "na1"), "key": _mask(v.get("api_key"))}
-                      for n, v in s.items()]}
+                      for n, v in s.items()],
+            "switch_with": "use_saved('<name>')"}
 
 @mcp.tool()
 def forget_saved(name: str) -> dict:

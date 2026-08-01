@@ -209,11 +209,14 @@ def part3_spike2(_: object) -> None:
     s = Server(capabilities={}, with_key=False)
     out = s.call("connect")
     msg = json.dumps(out)
+    # The guidance names whichever route actually applies: use_saved when environments
+    # are already saved locally, set_api_key when none are.
     check("no-elicitation client gets actionable guidance (not a crash)",
-          out.get("connected") is False and "set_api_key" in msg,
+          out.get("connected") is False and ("use_saved" in msg or "set_api_key" in msg),
           msg[:160])
+    guidance = json.dumps(s.call("list_records", {"object": "Contacts"}))
     check("a tool needing auth also degrades gracefully",
-          "set_api_key" in json.dumps(s.call("list_records", {"object": "Contacts"})))
+          "use_saved" in guidance or "set_api_key" in guidance)
     s.close()
 
     # Client that declares form elicitation: server should actually prompt (we decline).
@@ -263,6 +266,19 @@ def part4_apps() -> None:
         t = tools.get(nm, {})
         vis = ((t.get("_meta") or {}).get("ui") or {}).get("visibility")
         check(f"{nm} registered app-only", nm in tools and vis == ["app"], f"visibility={vis}")
+    ls = s.call("list_saved")
+    names = [e.get("name") for e in ls.get("saved", [])]
+    check("list_saved points at the switching tool",
+          ls.get("switch_with", "").startswith("use_saved"), f"saved={names}")
+    if "demo1" in names:
+        sw = s.call("use_saved", {"name": "demo1"})
+        check("use_saved switches env by name, no key in the conversation",
+              sw.get("connected") is True and sw.get("as") == "demo1", json.dumps(sw)[:110])
+        bad = s.call("use_saved", {"name": "definitely-not-an-env"})
+        check("unknown env name lists what is available",
+              bad.get("connected") is False and isinstance(bad.get("available"), list),
+              json.dumps(bad)[:110])
+
     co = s.call("app_custom_objects", {})
     rows = co.get("custom_objects") or []
     check("app_custom_objects returns definitions with labels + counts",
