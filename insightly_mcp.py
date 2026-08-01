@@ -27,7 +27,7 @@ import time
 import uuid
 import asyncio
 import pathlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
@@ -41,7 +41,7 @@ from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one 
 
 from app_ui import ENV_DASHBOARD_HTML
 
-SERVER_VERSION = "3.5.1"
+SERVER_VERSION = "3.6.0"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -306,25 +306,32 @@ async def env_dashboard(ctx: Context) -> Any:
            name="app_records",
            description="(dashboard) newest records for one object, for the drill-in panel.")
 async def app_records(object: str, ctx: Context, top: int = 25,
-                      order_by: Optional[str] = "DATE_UPDATED_UTC desc") -> Any:
-    """Newest records for one object — powers the dashboard drill-in."""
+                      order_by: Optional[str] = None) -> Any:
+    """Newest records for one object — powers the dashboard drill-in.
+
+    "Newest" means most recently created OR updated, newest first. Pass order_by to sort
+    on some other field instead."""
     err = await _ensure(ctx)
     if err:
         return {"error": err}
     o = _obj(object)
-    page = min(max(int(top), 1), 100)
-    body, hdrs = await _request("GET", f"/{o}",
-                               params={"top": page, "skip": 0, "brief": "true",
-                                       "count_total": "true"}, want_headers=True)
-    if isinstance(body, dict) and body.get("error"):
-        return body
-    items = _brief_strip(body if isinstance(body, list) else [])
-    out = _page_envelope(_apply_sort(items, order_by), 0, page)
-    if hdrs.get("x-total-count") is not None:
-        try:
-            out["total"] = int(hdrs["x-total-count"])
-        except ValueError:
-            pass
+    # The Explore lists ask for 200-500 (every stage, every user); clamping to 100 was
+    # silently truncating them.
+    page = min(max(int(top), 1), _SCAN_CAP)
+    items, total, basis = await _newest_records(o, page)
+    if isinstance(items, dict) and items.get("error"):
+        return items
+    if order_by:
+        items = _apply_sort(items, order_by)
+    out = _page_envelope(items, 0, page)
+    # A recency-ranked top-N has no "next page" — the API pages in id order, so resuming
+    # at skip=25 would hand back older records, not the next-newest ones.
+    out.pop("next_skip", None)
+    out["has_more"] = bool(total is not None and total > len(items))
+    out["sorted_by"] = order_by or "most recently created or updated, newest first"
+    out["basis"] = basis
+    if total is not None:
+        out["total"] = total
     return out
 
 
@@ -723,6 +730,101 @@ def _brief_strip(data: Any) -> Any:
                     item.pop(k, None)
     return data
 
+_SCAN_CAP = 500                          # the most records the API will hand over at once
+_RECENT_WINDOWS = (1, 7, 30, 90, 365, 1825)   # days back to try on /Search, narrowest first
+
+
+_WINDOW_BOUND = 2000                     # most records we will pull to rank one window
+
+
+async def _search_window(o: str, since: str) -> tuple:
+    """Every record changed since `since`, paged out of /{Object}/Search.
+
+    Returns (records, complete) — or (None, False) if the object has no Search endpoint.
+    Paging matters: taking only the first page would leave us ranking an arbitrary slice,
+    which is the very mistake this whole path exists to avoid.
+    """
+    out: list = []
+    while len(out) < _WINDOW_BOUND:
+        page = await _request("GET", f"/{o}/Search",
+                              params={"top": _SCAN_CAP, "skip": len(out), "brief": "true",
+                                      "updated_after_utc": since})
+        if isinstance(page, dict) and page.get("error"):
+            return (None, False) if not out else (out, False)
+        page = _brief_strip(page if isinstance(page, list) else [])
+        out.extend(page)
+        if len(page) < _SCAN_CAP:
+            return out, True             # short page: the window is exhausted
+    return out, False                    # hit the bound; there may be more in this window
+
+
+async def _newest_records(o: str, want: int) -> tuple:
+    """The `want` most recently created-or-updated records for one object, newest first.
+
+    The list endpoint cannot answer this on its own: it returns records in ascending id
+    order (oldest first) and silently ignores updated_after_utc, so asking it for page 1
+    yields the OLDEST records — which is exactly what the dashboard used to show.
+    /{Object}/Search does honour updated_after_utc, so:
+
+      * if the whole object fits in one page, fetch it and sort — an exact answer;
+      * otherwise widen a Search window until it yields enough to fill the list.
+
+    Returns (records, total_or_None, basis) where basis says how the set was derived, so
+    the caller can be honest about an answer that is a good approximation rather than a
+    guarantee.
+    """
+    body, hdrs = await _request("GET", f"/{o}", want_headers=True,
+                                params={"top": _SCAN_CAP, "skip": 0, "brief": "true",
+                                        "count_total": "true"})
+    if isinstance(body, dict) and body.get("error"):
+        return body, None, "error"
+    items = _brief_strip(body if isinstance(body, list) else [])
+    try:
+        total = int(hdrs.get("x-total-count"))
+    except (TypeError, ValueError):
+        total = None
+
+    # Everything the object has is in the page we just read: sorting it is exact.
+    if total is None or total <= len(items):
+        return _sort_newest(items)[:want], total, "exact"
+
+    for days in _RECENT_WINDOWS:
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        found, complete = await _search_window(o, since)
+        if found is None:
+            break                       # this object has no /Search — use the tail instead
+        if len(found) >= want:
+            basis = f"changed in the last {days}d"
+            return _sort_newest(found)[:want], total, (basis if complete else basis + " (capped)")
+
+    # No /Search, or nothing recent enough to fill the list. Ascending id order puts the
+    # newest CREATED records on the last page — far closer to "newest" than page 1.
+    tail = await _request("GET", f"/{o}", params={"top": want, "skip": max(0, total - want),
+                                                  "brief": "true"})
+    if isinstance(tail, dict) and tail.get("error"):
+        return _sort_newest(items)[:want], total, "oldest page only"
+    tail = _brief_strip(tail if isinstance(tail, list) else [])
+    return _sort_newest(tail)[:want], total, "newest by id"
+
+
+def _recency(rec: Any) -> str:
+    """Sort key for 'newest': the later of created and updated.
+
+    Insightly stamps DATE_UPDATED_UTC on create, so in practice updated >= created and
+    the max is just updated — but a record that is only ever created must not sort below
+    one that was merely touched, and custom objects are not guaranteed to follow the
+    convention. Taking the max is correct either way. Both are ISO-ish strings that sort
+    lexicographically; a missing pair sorts last (empty string)."""
+    if not isinstance(rec, dict):
+        return ""
+    return max(str(rec.get("DATE_UPDATED_UTC") or ""), str(rec.get("DATE_CREATED_UTC") or ""))
+
+
+def _sort_newest(items: list) -> list:
+    """Newest first by _recency. Stable, and never mutates the caller's list."""
+    return sorted(items, key=_recency, reverse=True)
+
+
 def _apply_sort(items: Any, order_by: Optional[str]) -> Any:
     """CLIENT-SIDE sort of already-fetched records (the API has no sort param).
     order_by like 'DATE_UPDATED_UTC desc'. Records missing the field sort last.
@@ -876,12 +978,25 @@ async def _request(method: str, path: str, params: Optional[dict] = None,
 
 
 async def _fetch_all(o: str, brief: bool = True, updated_after_utc: Optional[str] = None,
-                     max_records: int = 1000) -> dict:
-    """Page through an object up to max_records (hard cap FETCH_ALL_HARD_CAP), rate-paced."""
+                     max_records: int = 1000, newest_first: bool = False) -> dict:
+    """Page through an object up to max_records (hard cap FETCH_ALL_HARD_CAP), rate-paced.
+
+    newest_first only changes WHICH records a truncated scan keeps. Paging always runs in
+    the API's ascending-id order, so a capped scan normally covers the OLDEST slice of a
+    big object; starting at the tail instead covers the newest, which is what a caller
+    looking for "anything mentioning X" actually wants."""
     cap = min(max(int(max_records), 1), FETCH_ALL_HARD_CAP)
     out: list = []
     skip = 0
     truncated = False
+    if newest_first:
+        _, hdrs = await _request("GET", f"/{o}", want_headers=True,
+                                 params={"top": 1, "brief": "true", "count_total": "true"})
+        try:
+            skip = max(0, int(hdrs.get("x-total-count")) - cap)
+        except (TypeError, ValueError):
+            skip = 0
+        truncated = skip > 0
     while len(out) < cap:
         page = min(PAGE_MAX, cap - len(out))
         params = {"top": page, "skip": skip, "brief": str(brief).lower()}
@@ -1027,6 +1142,28 @@ def list_supported_objects() -> dict:
     return {"objects": COMMON_OBJECTS, "read_only": READONLY, "version": SERVER_VERSION}
 
 @mcp.tool()
+async def newest_records(object: str, ctx: Context, top: int = 25) -> Any:
+    """The most recently created or updated records for an object, newest first.
+
+    Use this for "latest", "recent" or "newest" questions. list_records cannot answer
+    them: the API returns records in ascending id order and has no sort parameter, so its
+    first page is the OLDEST records. This walks /{Object}/Search — which does honour a
+    date filter — or reads the whole object when it is small enough, then ranks by the
+    later of DATE_CREATED_UTC and DATE_UPDATED_UTC. The `basis` field says which."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    want = min(max(int(top), 1), _SCAN_CAP)
+    items, total, basis = await _newest_records(_obj(object), want)
+    if isinstance(items, dict) and items.get("error"):
+        return items
+    out = {"items": items, "returned": len(items),
+           "sorted_by": "most recently created or updated, newest first", "basis": basis}
+    if total is not None:
+        out["total"] = total
+    return out
+
+@mcp.tool()
 async def list_records(object: str, ctx: Context, top: int = 100, skip: int = 0, brief: bool = True,
                        order_by: Optional[str] = None, updated_after_utc: Optional[str] = None,
                        count_total: bool = False, fetch_all: bool = False, max_records: int = 1000) -> Any:
@@ -1041,10 +1178,13 @@ async def list_records(object: str, ctx: Context, top: int = 100, skip: int = 0,
       hard cap 5000), rate-paced under the API limit; returns
       {items, total_fetched, truncated}. truncated=true means the cap was hit and more remain.
     - count_total=true adds the real `total` (from Insightly's X-Total-Count header).
-    - updated_after_utc like '2026-01-01T00:00:00Z' for incremental pulls.
+    - updated_after_utc like '2026-01-01T00:00:00Z' for incremental pulls. NOTE the list
+      endpoint ignores this filter; search_records applies it for real.
     - order_by like 'DATE_UPDATED_UTC desc' sorts the RETURNED records CLIENT-SIDE
       (the API has no sort param); combine with fetch_all for a global sort.
 
+    For the newest records use newest_records — records come back in ascending id order,
+    so page 1 is the OLDEST, and order_by on its own just re-sorts that oldest page.
     For finding specific records prefer search_records (exact) or filter_records (contains)."""
     err = await _ensure(ctx)
     if err:
@@ -1137,16 +1277,21 @@ async def filter_records(object: str, contains: str, ctx: Context, field_name: O
     Scans up to max_scan records (default 1000, hard cap 5000, rate-paced) and returns
     those matching `contains` (case-insensitive) — in `field_name` if given, otherwise
     in ANY top-level field ("find anything mentioning X"). For exact match prefer
-    search_records. Returns {items, matched, scanned, truncated}."""
+    search_records. Returns {items, matched, scanned, truncated}.
+
+    If the object holds more than max_scan records the scan covers the NEWEST max_scan of
+    them (truncated=true says so) — the API pages oldest-first, so scanning from the front
+    would search only the stalest corner of a big object."""
     err = await _ensure(ctx)
     if err:
         return {"error": err}
-    res = await _fetch_all(_obj(object), brief=brief, max_records=max_scan)
+    res = await _fetch_all(_obj(object), brief=brief, max_records=max_scan, newest_first=True)
     if res.get("error") and not res.get("items"):
         return res
     needle = (contains or "").lower()
     hits = [r for r in res["items"] if _record_contains(r, needle, field_name)]
-    return {"items": hits, "matched": len(hits), "scanned": res.get("total_fetched", 0),
+    return {"items": _sort_newest(hits), "matched": len(hits),
+            "scanned": res.get("total_fetched", 0), "scanned_from": "newest",
             "truncated": res.get("truncated", False)}
 
 _SUMMARY_OBJECTS = ["Contacts", "Organisations", "Leads", "Opportunities", "Projects",

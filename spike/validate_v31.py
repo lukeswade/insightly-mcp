@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validation harness for the v3.1 features (SDK 2.x branch).
 
-Checks, against the live `demo1` env:
+Checks, against the live `pv2` test env:
   1. describe_object re-exposed as a CACHEABLE resource (ttl/scope actually on the wire)
   2. background TASKS: export with no cap, progress, paged result, cancel
   3. Spike 2: capability-aware elicitation (no-elicitation client gets guidance, not a crash)
@@ -24,6 +24,11 @@ DEPS = ["--with", "mcp==2.0.0", "--with", "httpx<1", "--with", "pydantic<3"]
 PASS, FAIL = "PASS", "FAIL"
 results: list[tuple[str, str, str]] = []
 
+# pv2 is the designated test environment — never point this harness at a shared demo env.
+_STORE = json.load(open(os.path.expanduser("~/.insightly-mcp/keys.json")))
+TEST_ENV = "pv2" if "pv2" in _STORE else sorted(_STORE)[0]
+CONTACTS_TOTAL = 0        # discovered at startup; the suite used to hardcode one env's count
+
 
 def check(name: str, ok: bool, detail: str = "") -> None:
     results.append((PASS if ok else FAIL, name, detail))
@@ -36,9 +41,8 @@ class Server:
     def __init__(self, capabilities: dict, with_key: bool = True, stateless: bool = False):
         env = {"HOME": os.path.expanduser("~"), "PATH": "/usr/bin:/bin"}
         if with_key:
-            keys = json.load(open(os.path.expanduser("~/.insightly-mcp/keys.json")))
-            env["INSIGHTLY_API_KEY"] = keys["demo1"]["api_key"]
-            env["INSIGHTLY_POD"] = "na1"
+            env["INSIGHTLY_API_KEY"] = _STORE[TEST_ENV]["api_key"]
+            env["INSIGHTLY_POD"] = _STORE[TEST_ENV].get("pod", "na1")
         self.p = subprocess.Popen([UV, "run", *DEPS, "python", SERVER],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True, bufsize=1, env=env)
@@ -163,17 +167,18 @@ def part2_tasks(s: Server) -> None:
     check("export completes", bool(final) and final.get("status") == "completed",
           f"status={(final or {}).get('status')} progress={(final or {}).get('progress')}")
     check("progress/total were tracked",
-          bool(final) and final.get("total") == 81 and final.get("result_count") == 81,
+          bool(final) and final.get("total") == CONTACTS_TOTAL and final.get("result_count") == CONTACTS_TOTAL,
           f"total={(final or {}).get('total')} count={(final or {}).get('result_count')}")
 
     page = s.call("task_result", {"task_id": tid, "top": 25})
     check("task_result pages the payload",
-          page.get("returned") == 25 and page.get("count") == 81 and page.get("has_more") is True,
+          page.get("returned") == 25 and page.get("count") == CONTACTS_TOTAL and page.get("has_more") is True,
           f"returned={page.get('returned')} count={page.get('count')} next_skip={page.get('next_skip')}")
-    tail = s.call("task_result", {"task_id": tid, "top": 25, "skip": 75})
+    last_skip = max(0, CONTACTS_TOTAL - 6)          # whatever env this is, land 6 from the end
+    tail = s.call("task_result", {"task_id": tid, "top": 25, "skip": last_skip})
     check("last page is short and ends pagination",
-          tail.get("returned") == 6 and tail.get("has_more") is False,
-          f"returned={tail.get('returned')} has_more={tail.get('has_more')}")
+          tail.get("returned") == CONTACTS_TOTAL - last_skip and tail.get("has_more") is False,
+          f"skip={last_skip} returned={tail.get('returned')} has_more={tail.get('has_more')}")
     check("brief stripping applied in export",
           all("Body" not in r for r in page.get("items", []) if isinstance(r, dict)))
 
@@ -281,10 +286,10 @@ def part4_apps() -> None:
     names = [e.get("name") for e in ls.get("saved", [])]
     check("list_saved points at the switching tool",
           ls.get("switch_with", "").startswith("use_saved"), f"saved={names}")
-    if "demo1" in names:
-        sw = s.call("use_saved", {"name": "demo1"})
+    if TEST_ENV in names:
+        sw = s.call("use_saved", {"name": TEST_ENV})
         check("use_saved switches env by name, no key in the conversation",
-              sw.get("connected") is True and sw.get("as") == "demo1", json.dumps(sw)[:110])
+              sw.get("connected") is True and sw.get("as") == TEST_ENV, json.dumps(sw)[:110])
         bad = s.call("use_saved", {"name": "definitely-not-an-env"})
         check("unknown env name lists what is available",
               bad.get("connected") is False and isinstance(bad.get("available"), list),
@@ -298,7 +303,7 @@ def part4_apps() -> None:
           f"total={co.get('total')} top={rows[0].get('label') if rows else None}={rows[0].get('count') if rows else None}")
     recs = s.call("app_records", {"object": "Contacts", "top": 5})
     check("app_records drives the drill-in panel",
-          recs.get("returned") == 5 and recs.get("total") == 81,
+          recs.get("returned") == 5 and recs.get("total") == CONTACTS_TOTAL,
           f"returned={recs.get('returned')} total={recs.get('total')}")
     flds = s.call("app_fields", {"object": "Opportunities"})
     check("app_fields drives the Fields view",
@@ -332,7 +337,7 @@ def part4_apps() -> None:
 
     out = s.call("env_dashboard")
     check("dashboard tool returns real counts",
-          isinstance(out.get("counts"), dict) and out["counts"].get("Contacts") == 81,
+          isinstance(out.get("counts"), dict) and out["counts"].get("Contacts") == CONTACTS_TOTAL,
           f"contacts={out.get('counts', {}).get('Contacts')}")
     check("explains why no UI rendered, citing the protocol",
           "2026-07-28" in str(out.get("ui", "")), str(out.get("ui"))[:120])
@@ -349,6 +354,51 @@ def part4_apps() -> None:
     s.close()
 
 
+def part6_newest() -> None:
+    """The dashboard's "newest" lists must really be newest — the list endpoint returns
+    records oldest-first and has no sort param, so this used to show the OLDEST page."""
+    print("\n6. newest-first record lists")
+    s = Server(capabilities={})
+    truth = s.call("list_records", {"object": "Tasks", "fetch_all": True, "brief": True})
+    items = truth.get("items", [])
+    if not items:
+        check("Tasks available to rank", False, "no records")
+        s.close()
+        return
+
+    def recency(r):
+        return max(str(r.get("DATE_UPDATED_UTC") or ""), str(r.get("DATE_CREATED_UTC") or ""))
+
+    want = [r["TASK_ID"] for r in sorted(items, key=recency, reverse=True)[:25]]
+    got = s.call("app_records", {"object": "Tasks", "top": 25})
+    ids = [r.get("TASK_ID") for r in got.get("items", [])]
+    check("app_records returns the genuinely newest records",
+          set(ids) == set(want), f"overlap={len(set(ids) & set(want))}/25 basis={got.get('basis')}")
+    keys = [recency(r) for r in got.get("items", [])]
+    check("newest first, oldest last", keys == sorted(keys, reverse=True))
+    check("ranked on created OR updated, whichever is later",
+          "created or updated" in str(got.get("sorted_by")), str(got.get("sorted_by")))
+    check("no misleading next_skip on a recency-ranked list", "next_skip" not in got)
+
+    nr = s.call("newest_records", {"object": "Tasks", "top": 10})
+    check("newest_records answers the same question from chat",
+          [r.get("TASK_ID") for r in nr.get("items", [])] == want[:10],
+          f"basis={nr.get('basis')}")
+
+    # the Explore lists ask for more than the old 100-record clamp allowed
+    stages = s.call("app_records", {"object": "PipelineStages", "top": 500})
+    check("app_records honours a top above 100 (Explore asks for 500)",
+          stages.get("top") == 500, f"top={stages.get('top')} returned={stages.get('returned')}")
+
+    f = s.call("filter_records", {"object": "Tasks", "contains": "a", "max_scan": 50})
+    oldest = {r["TASK_ID"] for r in sorted(items, key=recency)[:50]}
+    check("a truncated filter scan covers the newest records, not the oldest",
+          f.get("scanned_from") == "newest"
+          and not ({r["TASK_ID"] for r in f.get("items", [])} & oldest),
+          f"scanned={f.get('scanned')} truncated={f.get('truncated')}")
+    s.close()
+
+
 def part5_audit() -> None:
     print("\n5. swagger/API-doc audit fixes")
     s = Server(capabilities={})
@@ -358,11 +408,14 @@ def part5_audit() -> None:
           isinstance(ci.get("daily_quota"), dict) and ci["daily_quota"].get("limit") is not None,
           f"{ci.get('daily_quota')}")
 
+    # a surname that actually exists here, rather than one baked in from another env
+    sample = s.call("list_records", {"object": "Contacts", "top": 1}).get("items", [{}])
+    surname = (sample[0].get("LAST_NAME") if sample else None) or "Smith"
     sr = s.call("search_records", {"object": "Contacts", "field_name": "LAST_NAME",
-                                   "field_value": "Shedron", "count_total": True})
+                                   "field_value": surname, "count_total": True})
     check("search_records supports count_total (X-Total-Count)",
           sr.get("total") is not None and sr.get("returned", 0) >= 1,
-          f"total={sr.get('total')} returned={sr.get('returned')}")
+          f"LAST_NAME={surname!r} total={sr.get('total')} returned={sr.get('returned')}")
 
     ali = s.call("list_records", {"object": "quotes", "top": 1})
     check("'quotes' aliases to Quotation (docs: 'Quote' is rejected)",
@@ -404,6 +457,12 @@ def part5_audit() -> None:
 
 
 def main() -> int:
+    global CONTACTS_TOTAL
+    probe = Server(capabilities={})
+    CONTACTS_TOTAL = (probe.call("list_records", {"object": "Contacts", "count_total": True})
+                      .get("total", 0))
+    probe.close()
+    print(f"test env: {TEST_ENV} (Contacts={CONTACTS_TOTAL})")
     part1_caching()
     s = Server(capabilities={"elicitation": {"form": {}}})
     print("\nserver:", (s.init or {}).get("result", {}).get("serverInfo"))
@@ -414,6 +473,7 @@ def main() -> int:
     part3_spike2(None)
     part4_apps()
     part5_audit()
+    part6_newest()
 
     failed = [r for r in results if r[0] == FAIL]
     print(f"\n=== {len(results) - len(failed)}/{len(results)} checks passed ===")
