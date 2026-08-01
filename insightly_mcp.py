@@ -41,7 +41,7 @@ from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one 
 
 from app_ui import ENV_DASHBOARD_HTML
 
-SERVER_VERSION = "3.3.0"
+SERVER_VERSION = "3.4.0"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -326,6 +326,67 @@ async def app_records(object: str, ctx: Context, top: int = 25,
         except ValueError:
             pass
     return out
+
+
+@apps.tool(resource_uri="ui://insightly/env-dashboard.html", visibility=["app"],
+           name="app_envs",
+           description="(dashboard) saved environments and which one is active.")
+async def app_envs(ctx: Context) -> Any:
+    """Saved environments for the picker. Keys are masked and never leave this machine."""
+    saved = _load_saved()
+    active = SESSION.get("name")
+    return {"active": active,
+            "envs": [{"name": n, "pod": saved[n].get("pod", "na1"),
+                      "masked": _mask(saved[n].get("api_key")), "active": n == active}
+                     for n in sorted(saved)],
+            "count": len(saved)}
+
+
+@apps.tool(resource_uri="ui://insightly/env-dashboard.html", visibility=["app"],
+           name="app_use_env",
+           description="(dashboard) switch to a saved environment by name.")
+async def app_use_env(name: str, ctx: Context) -> Any:
+    """Switch environments from the picker — the key is read from the local key store."""
+    return await use_saved(name=name, ctx=ctx)
+
+
+@apps.tool(resource_uri="ui://insightly/env-dashboard.html", visibility=["app"],
+           name="app_add_env",
+           description="(dashboard) save a new environment and switch to it.")
+async def app_add_env(name: str, api_key: str, ctx: Context, pod: str = "na1") -> Any:
+    """Save a new environment under a friendly name, verify the key, and make it active.
+
+    The key is written to the local key store (chmod 600) and is usable by name from then
+    on. Verifies before saving so a typo cannot leave a dead entry in the list.
+    """
+    name = (name or "").strip()
+    api_key = (api_key or "").strip()
+    pod = (pod or "na1").strip() or "na1"
+    if not name:
+        return {"saved": False, "error": "give the environment a name so you can switch to it later."}
+    if not api_key:
+        return {"saved": False, "error": "the API key is required (Insightly: User Settings then API)."}
+    saved = _load_saved()
+    replacing = name in saved
+
+    # Verify against the API BEFORE writing, so a bad key never enters the list.
+    prev = dict(SESSION)
+    SESSION.update(api_key=api_key, pod=pod, name=name)
+    _CLIENT_ID_RESET()
+    chk = await _request("GET", "/Contacts", params={"top": 1, "brief": "true"})
+    if isinstance(chk, dict) and chk.get("error"):
+        SESSION.update(prev)
+        _CLIENT_ID_RESET()
+        return {"saved": False,
+                "error": f"that key did not work on pod '{pod}': {chk['error']}",
+                "hint": "check the key was copied whole, and that the pod matches your API URL."}
+
+    saved[name] = {"api_key": api_key, "pod": pod}
+    _save_saved(saved)
+    return {"saved": True, "connected": True, "as": name, "pod": pod,
+            "replaced": replacing,
+            "note": f"'{name}' is saved on this machine and active. Switch back to it any time "
+                    f"with the picker or use_saved('{name}')."}
 
 
 @apps.tool(resource_uri="ui://insightly/env-dashboard.html", visibility=["app"],

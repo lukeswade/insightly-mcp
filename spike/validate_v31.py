@@ -266,6 +266,17 @@ def part4_apps() -> None:
         t = tools.get(nm, {})
         vis = ((t.get("_meta") or {}).get("ui") or {}).get("visibility")
         check(f"{nm} registered app-only", nm in tools and vis == ["app"], f"visibility={vis}")
+    envs = s.call("app_envs")
+    check("app_envs lists saved environments with masked keys",
+          envs.get("count", 0) >= 1 and all("masked" in e and "api_key" not in e
+                                            for e in envs.get("envs", [])),
+          f"count={envs.get('count')} active={envs.get('active')}")
+    check("a bad key is refused and never enters the saved list",
+          (lambda bad: bad.get("saved") is False
+           and "should-not-persist" not in [e["name"] for e in s.call("app_envs").get("envs", [])])(
+              s.call("app_add_env", {"name": "should-not-persist",
+                                     "api_key": "totally-invalid", "pod": "na1"})))
+
     ls = s.call("list_saved")
     names = [e.get("name") for e in ls.get("saved", [])]
     check("list_saved points at the switching tool",
@@ -308,7 +319,10 @@ def part4_apps() -> None:
                             ('data-fields=', "fields button"),
                             ('id="refresh"', "refresh button"),
                             ("ui/notifications/size-changed", "dynamic height reporting"),
-                            ('id="custom"', "custom-objects section")):
+                            ('id="custom"', "custom-objects section"),
+                            ('id="envbar"', "environment picker"),
+                            ("app_add_env", "add-environment form"),
+                            ('type="password"', "key field is masked in the form")):
             check(f"UI implements the {label}", frag in html)
 
     out = s.call("env_dashboard")

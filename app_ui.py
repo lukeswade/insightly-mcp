@@ -112,6 +112,30 @@ ENV_DASHBOARD_HTML = """<!doctype html>
   @keyframes pulse { 0%,100% { opacity: .45 } 50% { opacity: .9 } }
   @media (prefers-reduced-motion: reduce) { .skel { animation: none } }
   .note { margin-top: 12px; font-size: 11.5px; color: var(--muted); }
+  .envbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 12px;
+            padding: 9px 10px; background: var(--card2); border: 1px solid var(--line);
+            border-radius: var(--radius); }
+  .envbar .lbl { font-size: 11px; font-weight: 600; letter-spacing: .08em; color: var(--muted);
+                 text-transform: uppercase; margin-right: 2px; }
+  button.env[aria-current="true"] { border-color: var(--good); color: var(--good);
+                                    font-weight: 600; }
+  button.env[aria-current="true"]::before { content: "* "; }
+  button.addenv { border-style: dashed; color: var(--muted); }
+  .envform { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+             margin-top: 8px; padding-top: 10px; border-top: 1px solid var(--line); }
+  @media (max-width: 520px) { .envform { grid-template-columns: 1fr; } }
+  .envform label { font-size: 11px; font-weight: 600; letter-spacing: .06em; color: var(--muted);
+                   text-transform: uppercase; display: block; margin-bottom: 3px; }
+  .envform input { width: 100%; font: inherit; font-size: 13px; padding: 6px 9px;
+                   color: var(--ink); background: var(--card); border: 1px solid var(--line);
+                   border-radius: 8px; }
+  .envform input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .envform .wide { grid-column: 1 / -1; }
+  .envform .actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; }
+  .envform .privacy { font-size: 11px; color: var(--muted); line-height: 1.45; }
+  .envform .status { font-size: 12px; }
+  .envform .status.bad { color: var(--accent); }
+  .envform .status.good { color: var(--good); }
   .section { margin-top: 14px; }
   .section-head { display: flex; align-items: baseline; gap: 8px; margin: 0 0 8px; }
   .section-head h2 { margin: 0; font-size: 11px; font-weight: 600; letter-spacing: .08em;
@@ -133,6 +157,8 @@ ENV_DASHBOARD_HTML = """<!doctype html>
   <span class="spacer"></span>
   <button class="ghost" id="refresh" title="Re-read the environment">Refresh</button>
 </header>
+
+<div class="envbar" id="envbar" hidden></div>
 
 <div class="toolbar" id="toolbar" hidden>
   <span class="lbl">Explore</span>
@@ -351,7 +377,8 @@ ENV_DASHBOARD_HTML = """<!doctype html>
   var NAME_FIELDS = ["RECORD_NAME", "ORGANISATION_NAME", "OPPORTUNITY_NAME", "PROJECT_NAME", "QUOTATION_NAME",
                      "PRODUCT_NAME", "TITLE", "Title", "SUBJECT", "NAME", "TASK_NAME",
                      "MILESTONE_NAME", "TICKET_TITLE"];
-  var state = { data: null, open: null, custom: null, pipes: null, stages: null };
+  var state = { data: null, open: null, custom: null, pipes: null, stages: null,
+               envs: null, activeEnv: null, addOpen: false };
 
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
@@ -414,6 +441,7 @@ ENV_DASHBOARD_HTML = """<!doctype html>
     html += '<div class="note">Click any tile to look inside — newest records, or its full field list.</div>';
     document.getElementById("body").innerHTML = html;
     reportSize();
+    if (state.envs === null) { state.envs = []; state.activeEnv = d.connected_as; loadEnvs(false); }
     if (state.custom === null) { state.custom = []; loadCustomObjects(); }
   }
 
@@ -475,6 +503,124 @@ ENV_DASHBOARD_HTML = """<!doctype html>
         + std.map(function (f) { return '<span class="chip">' + esc(f) + '</span>'; }).join("") + '</div>';
     }
     return out;
+  }
+
+  // ------------------------------------------------------------- environment picker
+  // Switching is secret-free: the server reads the saved key from its local store, so no
+  // key travels through the app, the host, or the conversation.
+  function envBar() {
+    var el = document.getElementById("envbar");
+    var envs = state.envs || [];
+    var active = state.activeEnv;
+    var html = '<span class="lbl">Environment</span>';
+    if (!envs.length) {
+      html += '<span class="muted" style="font-size:12.5px">none saved yet</span>';
+    } else {
+      html += envs.map(function (e) {
+        var on = e.name === active;
+        return '<button class="env" data-env="' + esc(e.name) + '"'
+          + ' aria-current="' + (on ? "true" : "false") + '"'
+          + ' title="' + esc(e.name) + ' - pod ' + esc(e.pod) + ', key ' + esc(e.masked) + '">'
+          + esc(e.name) + '</button>';
+      }).join("");
+    }
+    html += '<span class="spacer"></span>'
+      + '<button class="addenv" data-addenv="1">+ Add environment</button>';
+    if (state.addOpen) {
+      html += '<form class="envform" id="envform">'
+        + '<div><label for="envname">Name</label>'
+        + '<input id="envname" name="name" placeholder="e.g. acme-demo" autocomplete="off" required></div>'
+        + '<div><label for="envpod">Pod</label>'
+        + '<input id="envpod" name="pod" value="na1" autocomplete="off"></div>'
+        + '<div class="wide"><label for="envkey">Insightly API key</label>'
+        + '<input id="envkey" name="api_key" type="password" autocomplete="off"'
+        + ' placeholder="Insightly then User Settings then API" required></div>'
+        + '<div class="actions">'
+        + '<button type="submit" id="envsave">Verify and save</button>'
+        + '<button type="button" data-cancelenv="1" class="ghost">Cancel</button>'
+        + '<span class="status" id="envstatus"></span></div>'
+        + '<div class="wide privacy">The key is verified against Insightly, then stored on this '
+        + 'machine so you can switch by name later. It travels through this tool call, so it may '
+        + 'appear in the conversation log - use demo environments only.</div>'
+        + '</form>';
+    }
+    el.innerHTML = html;
+    el.hidden = false;
+    reportSize();
+  }
+
+  function loadEnvs(afterSwitch) {
+    return callTool("app_envs", {}, "list_saved").then(function (r) {
+      // app_envs returns {envs, active}; list_saved returns {saved, active}.
+      var list = r.envs || r.saved || [];
+      state.envs = list.map(function (e) {
+        return { name: e.name, pod: e.pod || "na1", masked: e.masked || e.key || "" };
+      });
+      state.activeEnv = r.active || state.activeEnv;
+      envBar();
+      if (afterSwitch) refreshDashboard();
+    }).catch(function () { /* picker is optional; the dashboard stands without it */ });
+  }
+
+  function refreshDashboard() {
+    return callTool("env_dashboard", {}).then(function (d) {
+      if (d && d.counts) {
+        state.custom = null;                     // custom objects differ per environment
+        document.getElementById("custom").innerHTML = "";
+        document.getElementById("panel").innerHTML = "";
+        render(d);
+      }
+    }).catch(function () {});
+  }
+
+  function switchEnv(name) {
+    var el = document.getElementById("envbar");
+    Array.prototype.forEach.call(el.querySelectorAll("button"), function (b) { b.disabled = true; });
+    callTool("app_use_env", { name: name }, "use_saved")
+      .then(function (r) {
+        if (r && r.connected) {
+          state.activeEnv = r.as || name;
+          return loadEnvs(true);
+        }
+        envBar();
+      })
+      .catch(function () { envBar(); });
+  }
+
+  function submitEnv(form) {
+    var status = document.getElementById("envstatus");
+    var btn = document.getElementById("envsave");
+    var name = form.name.value.trim(), key = form.api_key.value.trim(),
+        pod = (form.pod.value || "na1").trim();
+    if (!name || !key) {
+      status.className = "status bad";
+      status.textContent = "Name and API key are both required.";
+      return;
+    }
+    btn.disabled = true;
+    status.className = "status";
+    status.textContent = "Verifying against Insightly...";
+    callTool("app_add_env", { name: name, api_key: key, pod: pod })
+      .then(function (r) {
+        if (r && r.saved) {
+          status.className = "status good";
+          status.textContent = "Saved. Switching to " + name + "...";
+          form.api_key.value = "";               // do not leave the key sitting in the DOM
+          state.addOpen = false;
+          state.activeEnv = name;
+          loadEnvs(true);
+        } else {
+          btn.disabled = false;
+          status.className = "status bad";
+          status.textContent = (r && (r.error || r.hint)) || "Could not save that environment.";
+        }
+      })
+      .catch(function (e) {
+        btn.disabled = false;
+        status.className = "status bad";
+        status.textContent = "This host would not let the panel save it - "
+          + "ask in chat instead: add an Insightly environment called " + name + ".";
+      });
   }
 
   function customObjectsGrid(rows) {
@@ -702,6 +848,10 @@ ENV_DASHBOARD_HTML = """<!doctype html>
         .then(function () { t.disabled = false; });
       return;
     }
+    if (t.dataset.env) { switchEnv(t.dataset.env); return; }
+    if (t.dataset.addenv) { state.addOpen = true; envBar();
+      var f = document.getElementById("envname"); if (f) f.focus(); return; }
+    if (t.dataset.cancelenv) { state.addOpen = false; envBar(); return; }
     if (t.dataset.close) { document.getElementById("panel").innerHTML = ""; markOpen(null); return; }
     if (t.dataset.ask) { askInChat(t.dataset.ask); return; }
     if (t.dataset.fields) { showFields(t.dataset.fields); markOpen(t.dataset.fields); return; }
@@ -716,6 +866,13 @@ ENV_DASHBOARD_HTML = """<!doctype html>
       return;
     }
     if (t.dataset.object) { showObject(t.dataset.object); markOpen(t.dataset.object); return; }
+  });
+
+  document.addEventListener("submit", function (e) {
+    if (e.target && e.target.id === "envform") {
+      e.preventDefault();
+      submitEnv(e.target);
+    }
   });
 
   function markOpen(obj) {
