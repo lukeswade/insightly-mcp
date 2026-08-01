@@ -320,7 +320,10 @@ def part4_apps() -> None:
                             ('id="refresh"', "refresh button"),
                             ("ui/notifications/size-changed", "dynamic height reporting"),
                             ('id="custom"', "custom-objects section"),
-                            ('id="envbar"', "environment picker"),
+                            ('id="envtag"', "environment picker in the header"),
+                            ("contentHeight", "content-based sizing (shrinks as well as grows)"),
+                            ("app_rename_env", "rename control"),
+                            ("app_remove_env", "remove control"),
                             ("app_add_env", "add-environment form"),
                             ('type="password"', "key field is masked in the form")):
             check(f"UI implements the {label}", frag in html)

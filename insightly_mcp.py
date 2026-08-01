@@ -41,7 +41,7 @@ from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one 
 
 from app_ui import ENV_DASHBOARD_HTML
 
-SERVER_VERSION = "3.4.0"
+SERVER_VERSION = "3.5.0"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -387,6 +387,31 @@ async def app_add_env(name: str, api_key: str, ctx: Context, pod: str = "na1") -
             "replaced": replacing,
             "note": f"'{name}' is saved on this machine and active. Switch back to it any time "
                     f"with the picker or use_saved('{name}')."}
+
+
+@apps.tool(resource_uri="ui://insightly/env-dashboard.html", visibility=["app"],
+           name="app_rename_env",
+           description="(dashboard) rename a saved environment.")
+async def app_rename_env(name: str, new_name: str, ctx: Context) -> Any:
+    """Rename an environment from the picker."""
+    return rename_saved(name=name, new_name=new_name)
+
+
+@apps.tool(resource_uri="ui://insightly/env-dashboard.html", visibility=["app"],
+           name="app_remove_env",
+           description="(dashboard) remove a saved environment.")
+async def app_remove_env(name: str, ctx: Context) -> Any:
+    """Forget a saved environment. Only the stored key is dropped; nothing in Insightly
+    changes. If it was the active one the session stays connected until you switch."""
+    name = (name or "").strip()
+    saved = _load_saved()
+    if name not in saved:
+        return {"ok": False, "error": f"no saved environment called '{name}'.",
+                "available": sorted(saved)}
+    res = forget_saved(name=name)
+    res["was_active"] = SESSION.get("name") == name
+    res["remaining"] = sorted(_load_saved())
+    return res
 
 
 @apps.tool(resource_uri="ui://insightly/env-dashboard.html", visibility=["app"],
@@ -951,6 +976,25 @@ def list_saved() -> dict:
             "saved": [{"name": n, "pod": v.get("pod", "na1"), "key": _mask(v.get("api_key"))}
                       for n, v in s.items()],
             "switch_with": "use_saved('<name>')"}
+
+@mcp.tool()
+def rename_saved(name: str, new_name: str) -> dict:
+    """Rename a saved environment. The key is untouched — only the label you switch by."""
+    name, new_name = (name or "").strip(), (new_name or "").strip()
+    saved = _load_saved()
+    if name not in saved:
+        return {"ok": False, "error": f"no saved environment called '{name}'.",
+                "available": sorted(saved)}
+    if not new_name:
+        return {"ok": False, "error": "the new name cannot be empty."}
+    if new_name != name and new_name in saved:
+        return {"ok": False, "error": f"'{new_name}' already exists — pick another name."}
+    saved[new_name] = saved.pop(name)
+    _save_saved(saved)
+    if SESSION.get("name") == name:
+        SESSION["name"] = new_name          # keep the active label in step
+    return {"ok": True, "renamed": {"from": name, "to": new_name}}
+
 
 @mcp.tool()
 def forget_saved(name: str) -> dict:
