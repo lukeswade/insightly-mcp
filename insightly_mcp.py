@@ -41,7 +41,7 @@ from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one 
 
 from app_ui import ENV_DASHBOARD_HTML
 
-SERVER_VERSION = "3.6.0"
+SERVER_VERSION = "3.7.0"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -328,6 +328,7 @@ async def app_records(object: str, ctx: Context, top: int = 25,
     # at skip=25 would hand back older records, not the next-newest ones.
     out.pop("next_skip", None)
     out["has_more"] = bool(total is not None and total > len(items))
+    out = _fit(out.pop("items", []), out)
     out["sorted_by"] = order_by or "most recently created or updated, newest first"
     out["basis"] = basis
     if total is not None:
@@ -507,6 +508,12 @@ PK = {
     "Emails": "EMAIL_ID", "Quotation": "QUOTE_ID", "Milestones": "MILESTONE_ID",
     "Pricebook": "PRICEBOOK_ID", "Ticket": "TICKET_ID", "KnowledgeArticle": "ARTICLE_ID",
 }
+# Where a human-readable label lives, per object. Insightly is not consistent about this,
+# so it is a search order rather than a map.
+_NAME_FIELDS = ("ORGANISATION_NAME", "OPPORTUNITY_NAME", "PROJECT_NAME", "QUOTATION_NAME",
+                "PRODUCT_NAME", "RECORD_NAME", "TASK_NAME", "MILESTONE_NAME",
+                "TICKET_TITLE", "SUBJECT", "TITLE", "NAME")
+
 # Read-only / reference collections that exist in the v3.1 swagger. Listed so they are
 # discoverable and alias-resolvable; anything else still works via raw_request.
 COMMON_OBJECTS = sorted(PK.keys()) + [
@@ -719,22 +726,171 @@ def _obj(name: str) -> str:
 # Heavy fields Insightly's own `brief` mode fails to strip — full HTML/long free text
 # that bloats list results (e.g. a KnowledgeArticle Body can be tens of KB). We drop
 # them client-side when brief is requested.
-_BRIEF_DROP = ("Body",)
+# brief is the SCAN mode: strip everything bulky so a wide sweep stays cheap. It used to
+# be the single name "Body", which matches nothing Insightly actually returns — BODY is
+# upper-case and the real weight is DETAILS/CUSTOMFIELDS. Matched case-insensitively for
+# that reason. Anything returned to the user as a final answer gets hydrated back to whole
+# records by _hydrate, because CUSTOMFIELDS is often where the interesting data lives.
+_BRIEF_DROP = frozenset(("body", "details", "customfields", "image_url", "etag"))
 
 def _brief_strip(data: Any) -> Any:
     """Drop heavy fields from each record in a brief list result; pass other shapes through."""
     if isinstance(data, list):
         for item in data:
             if isinstance(item, dict):
-                for k in _BRIEF_DROP:
+                for k in [k for k in item if k.lower() in _BRIEF_DROP]:
                     item.pop(k, None)
     return data
+
+_RESULT_BUDGET = 900_000     # hosts reject a tool result over 1MB; leave room for the envelope
+
+
+def _fit(items: list, envelope: dict, key: str = "items") -> dict:
+    """Put `items` into `envelope` under `key`, dropping from the tail until it fits.
+
+    A result over the host's 1MB ceiling is thrown away before the model ever sees it — the
+    user just gets "Tool result is too large" and Claude gets nothing. Returning fewer
+    records with an explicit note is strictly better than returning nothing, and saying so
+    out loud is what stops it looking like a bug.
+    """
+    envelope[key] = items
+    if len(json.dumps(envelope, default=str)) <= _RESULT_BUDGET:
+        return envelope
+    lo, hi = 0, len(items)                       # largest prefix that fits
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        envelope[key] = items[:mid]
+        if len(json.dumps(envelope, default=str)) <= _RESULT_BUDGET:
+            lo = mid
+        else:
+            hi = mid - 1
+    envelope[key] = items[:lo]
+    envelope["capped"] = True
+    envelope["capped_note"] = (
+        f"Result trimmed to {lo} of {len(items)} records to stay under the host's 1MB "
+        "limit. Ask for a smaller top, add brief=true to drop bulky fields, narrow the "
+        "object/date range, or use start_export for the whole object (it pages through "
+        "task_result without a size ceiling).")
+    return envelope
+
 
 _SCAN_CAP = 500                          # the most records the API will hand over at once
 _RECENT_WINDOWS = (1, 7, 30, 90, 365, 1825)   # days back to try on /Search, narrowest first
 
 
-_WINDOW_BOUND = 2000                     # most records we will pull to rank one window
+_WINDOW_BOUND = 3000                     # most records we will pull to rank one window
+_HYDRATE_MAX = 100                        # per-record GETs we are willing to spend on a list
+
+
+async def _hydrate(o: str, items: list, limit: int = _HYDRATE_MAX) -> tuple:
+    """Refetch each record in full so the answer carries custom fields.
+
+    brief is how we scan cheaply, but CUSTOMFIELDS is frequently where the meaningful data
+    sits, so a list handed back as a final answer must not be the stripped version.
+    Insightly has no batch endpoint and no field projection, so this costs one GET per
+    record — hence the cap. Records that fail to refetch keep their brief form rather than
+    disappearing.
+    """
+    pk = PK.get(o)
+    if not pk or not items:
+        return items, "not hydrated (no primary key known for this object)"
+    if len(items) > limit:
+        return items, f"not hydrated ({len(items)} records exceeds the {limit}-call budget)"
+    out = []
+    for rec in items:
+        rid = rec.get(pk) if isinstance(rec, dict) else None
+        if rid is None:
+            out.append(rec)
+            continue
+        full = await _request("GET", f"/{o}/{rid}")
+        out.append(full if isinstance(full, dict) and not full.get("error") else rec)
+    return out, f"hydrated ({len(items)} full records incl. custom fields)"
+
+
+# A window built from updated_after_utc only bounds fields that cannot postdate the last
+# update. Recording a close writes the record, so ACTUAL_CLOSE_DATE <= DATE_UPDATED_UTC
+# always holds; a forecast or due date is free to sit in the future, so the same window
+# would silently omit rows. Refuse those rather than answer them wrongly.
+_FORWARD_DATED = ("FORECAST", "DUE", "TARGET", "START", "END", "EXPIR", "RENEW", "NEXT")
+
+
+async def _newest_by_field(o: str, field: str, want: int) -> dict:
+    """The `want` records with the latest `field`, without scanning the whole object.
+
+    Insightly cannot sort, and cannot range-filter an arbitrary field — but /Search does
+    honour updated_after_utc and count_total, so a one-record request prices a window
+    before we commit to fetching it. Because the field can never postdate the record's last
+    update, "updated since T" is a superset of "field >= T": rank inside it and the answer
+    is exact, not approximate.
+
+    The stop condition proves itself: if the want-th result is NEWER than the window's
+    cutoff, no better record can exist outside the window. So pick the WIDEST window we can
+    afford to fetch (a wider one strictly dominates — it contains every narrower one), and
+    widen again if the proof still fails.
+    """
+    probes = 0
+    priced: list = []                    # (days, since, count) that we could afford
+    over: list = []                      # windows too big for the record bound
+    for days in _RECENT_WINDOWS[1:] + (3650,):
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        _, hdrs = await _request("GET", f"/{o}/Search", want_headers=True,
+                                 params={"top": 1, "brief": "true", "count_total": "true",
+                                         "updated_after_utc": since})
+        probes += 1
+        try:
+            count = int(hdrs.get("x-total-count"))
+        except (TypeError, ValueError):
+            return {"error": f"/{o}/Search did not report a count, so a window cannot be priced.",
+                    "hint": "Use start_export for this object — it pages without a cap."}
+        if count > _WINDOW_BOUND:
+            over.append((days, since, count))
+            break                        # everything wider is bigger still
+        priced.append((days, since, count))
+
+    if not priced and not over:
+        return {"error": f"no records in {o} carry a change date, so no window can be built.",
+                "hint": "Use start_export and rank the exported records."}
+    # Widest affordable window first, then one deliberate overshoot if the proof needs it.
+    plan = ([priced[-1]] if priced else []) + over[:1]
+    fetched, attempt = 0, None
+    for days, since, count in plan:
+        rows, whole = await _search_window(o, since)
+        if rows is None:
+            return {"error": f"/{o}/Search is not available for '{o}'.",
+                    "hint": "Use start_export and rank the exported records instead."}
+        fetched += len(rows)
+        have = sorted((r for r in rows if isinstance(r, dict) and r.get(field)),
+                      key=lambda r: str(r.get(field)), reverse=True)
+        top = have[:want]
+        edge = str(top[-1].get(field))[:10] if top else ""
+        proven = len(top) >= want and whole and edge > since[:10]
+        attempt = (days, since, count, have, top, proven, whole)
+        if proven:
+            break
+
+    days, since, count, have, top, proven, whole = attempt
+    out = {"object": o, "date_field": field, "sorted_by": f"{field}, newest first",
+           "returned": len(top), "window_days": days, "window_start": since[:10],
+           "records_updated_in_window": count,
+           "records_with_a_value_in_window": len(have),
+           "cost": {"count_probes": probes, "records_fetched": fetched},
+           "complete": proven}
+    if not proven:
+        if len(top) < want:
+            out["caveat"] = (f"Only {len(top)} records carry {field} within the last {days} "
+                             f"days — that is everything available in the widest window "
+                             f"that could be fetched.")
+        elif not whole:
+            out["caveat"] = (f"The {days}-day window exceeded the {_WINDOW_BOUND}-record "
+                             "fetch bound, so records inside it were not all ranked.")
+        else:
+            out["caveat"] = (f"The {len(top)}th value ({str(top[-1].get(field))[:10]}) falls "
+                             f"outside the {days}-day change window, so an older record "
+                             f"could rank higher. These are the best available without "
+                             f"scanning the object — use start_export to be certain.")
+    top, note = await _hydrate(o, top)
+    out["detail_level"] = note
+    return _fit(top, out)
 
 
 async def _search_window(o: str, since: str) -> tuple:
@@ -978,7 +1134,7 @@ async def _request(method: str, path: str, params: Optional[dict] = None,
 
 
 async def _fetch_all(o: str, brief: bool = True, updated_after_utc: Optional[str] = None,
-                     max_records: int = 1000, newest_first: bool = False) -> dict:
+                     max_records: int = 500, newest_first: bool = False) -> dict:
     """Page through an object up to max_records (hard cap FETCH_ALL_HARD_CAP), rate-paced.
 
     newest_first only changes WHICH records a truncated scan keeps. Paging always runs in
@@ -1142,6 +1298,72 @@ def list_supported_objects() -> dict:
     return {"objects": COMMON_OBJECTS, "read_only": READONLY, "version": SERVER_VERSION}
 
 @mcp.tool()
+async def newest_by(object: str, date_field: str, ctx: Context, top: int = 50) -> Any:
+    """Latest records by ANY date field — "the 50 most recently closed opportunities".
+
+    Use this whenever the ranking field is not the created/updated stamp, e.g.
+    newest_by('Opportunities', 'ACTUAL_CLOSE_DATE'). It does NOT scan the object: it prices
+    a change window with one-record count probes, fetches only that window, ranks inside
+    it, and reports the cost. On a 167k-opportunity org this answers in ~5 calls instead of
+    336. `complete: true` means the answer is provably the true top N.
+
+    Only works for fields that cannot postdate a record's last update (close dates, created
+    dates). Forecast/due/renewal dates are rejected, because a future-dated value can sit
+    outside any change window and the ranking would silently omit rows — export instead.
+
+    Returned records are hydrated to full detail, so custom fields are present."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    field = (date_field or "").strip().upper()
+    if not field:
+        return {"error": "date_field is required, e.g. 'ACTUAL_CLOSE_DATE'."}
+    if any(w in field for w in _FORWARD_DATED):
+        return {"error": f"{field} can hold future dates, so it cannot be bounded by a "
+                         "change window — the ranking would be silently incomplete.",
+                "hint": "Rank on a field that is written when the event happens "
+                        "(ACTUAL_CLOSE_DATE, DATE_CREATED_UTC), or run start_export and "
+                        "rank the exported records."}
+    return await _newest_by_field(_obj(object), field, min(max(int(top), 1), _HYDRATE_MAX))
+
+@mcp.tool()
+async def resolve_lookups(object: str, ids: list[int], ctx: Context) -> Any:
+    """Turn a list of record ids into {id: name} — for the ORGANISATION_ID / CONTACT_ID
+    style lookup fields that come back as bare numbers.
+
+    Insightly has no batch-get and no field projection, so this is one GET per id (and the
+    per-record endpoint ignores brief, returning ~10KB each). Doing it here means the model
+    spends one tool call and gets back only the names, instead of pulling 47 full records
+    into the conversation to read 47 strings. Unknown or deleted ids come back under
+    `missing`."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    o = _obj(object)
+    pk = PK.get(o)
+    wanted = list(dict.fromkeys(int(i) for i in (ids or [])))[:_HYDRATE_MAX]
+    if not wanted:
+        return {"error": "ids is required (a list of record ids)."}
+    names, missing = {}, []
+    for rid in wanted:
+        rec = await _request("GET", f"/{o}/{rid}")
+        if not isinstance(rec, dict) or rec.get("error"):
+            missing.append(rid)
+            continue
+        label = next((rec[f] for f in _NAME_FIELDS if rec.get(f)), None)
+        if label is None:
+            label = " ".join(str(rec[f]) for f in ("FIRST_NAME", "LAST_NAME") if rec.get(f)) or None
+        names[str(rid)] = label
+    out = {"object": o, "pk": pk, "names": names, "resolved": len(names),
+           "requested": len(wanted)}
+    if missing:
+        out["missing"] = missing
+    if len(ids or []) > _HYDRATE_MAX:
+        out["note"] = (f"Only the first {_HYDRATE_MAX} ids were resolved — each one costs an "
+                       "API call. Call again with the rest if you need them.")
+    return out
+
+@mcp.tool()
 async def newest_records(object: str, ctx: Context, top: int = 25) -> Any:
     """The most recently created or updated records for an object, newest first.
 
@@ -1153,20 +1375,22 @@ async def newest_records(object: str, ctx: Context, top: int = 25) -> Any:
     err = await _ensure(ctx)
     if err:
         return {"error": err}
+    o = _obj(object)
     want = min(max(int(top), 1), _SCAN_CAP)
-    items, total, basis = await _newest_records(_obj(object), want)
+    items, total, basis = await _newest_records(o, want)
     if isinstance(items, dict) and items.get("error"):
         return items
-    out = {"items": items, "returned": len(items),
+    items, note = await _hydrate(o, items)
+    out = {"returned": len(items), "detail_level": note,
            "sorted_by": "most recently created or updated, newest first", "basis": basis}
     if total is not None:
         out["total"] = total
-    return out
+    return _fit(items, out)
 
 @mcp.tool()
 async def list_records(object: str, ctx: Context, top: int = 100, skip: int = 0, brief: bool = True,
                        order_by: Optional[str] = None, updated_after_utc: Optional[str] = None,
-                       count_total: bool = False, fetch_all: bool = False, max_records: int = 1000) -> Any:
+                       count_total: bool = False, fetch_all: bool = False, max_records: int = 500) -> Any:
     """List records for an object (e.g. 'Contacts'). Returns a paginated envelope:
     {items, returned, skip, top, has_more, next_skip[, total]}.
 
@@ -1174,8 +1398,9 @@ async def list_records(object: str, ctx: Context, top: int = 100, skip: int = 0,
       every field incl. linked/custom fields.
     - Paging: default top=100 (max 500). If has_more is true, call again with the
       returned next_skip — OR pass fetch_all=true to get everything at once.
-    - fetch_all=true pages through the whole object up to max_records (default 1000,
-      hard cap 5000), rate-paced under the API limit; returns
+    - fetch_all=true pages through the whole object up to max_records (default 500 — one
+      page, which reliably fits a tool result; raise it if you need more, hard cap 5000),
+      rate-paced under the API limit; returns
       {items, total_fetched, truncated}. truncated=true means the cap was hit and more remain.
     - count_total=true adds the real `total` (from Insightly's X-Total-Count header).
     - updated_after_utc like '2026-01-01T00:00:00Z' for incremental pulls. NOTE the list
@@ -1194,7 +1419,7 @@ async def list_records(object: str, ctx: Context, top: int = 100, skip: int = 0,
         res = await _fetch_all(o, brief=brief, updated_after_utc=updated_after_utc, max_records=max_records)
         if order_by and isinstance(res.get("items"), list):
             res["items"] = _apply_sort(res["items"], order_by)
-        return res
+        return _fit(res.pop("items", []), res)
     page = min(max(top, 1), PAGE_MAX)
     params: dict = {"top": page, "skip": max(skip, 0), "brief": str(brief).lower()}
     if updated_after_utc:
@@ -1219,7 +1444,7 @@ async def list_records(object: str, ctx: Context, top: int = 100, skip: int = 0,
                 env["total"] = int(tot)
             except Exception:
                 env["total"] = tot
-    return env
+    return _fit(env.pop("items", []), env)
 
 @mcp.tool()
 async def search_records(object: str, field_name: str, field_value: str, ctx: Context,
@@ -1272,7 +1497,7 @@ async def find_by_email(object: str, email: str, ctx: Context) -> Any:
 
 @mcp.tool()
 async def filter_records(object: str, contains: str, ctx: Context, field_name: Optional[str] = None,
-                         brief: bool = True, max_scan: int = 1000) -> Any:
+                         brief: bool = False, max_scan: int = 1000) -> Any:
     """CONTAINS filter, done CLIENT-SIDE because Insightly's search is exact-match only.
     Scans up to max_scan records (default 1000, hard cap 5000, rate-paced) and returns
     those matching `contains` (case-insensitive) — in `field_name` if given, otherwise
@@ -1281,7 +1506,12 @@ async def filter_records(object: str, contains: str, ctx: Context, field_name: O
 
     If the object holds more than max_scan records the scan covers the NEWEST max_scan of
     them (truncated=true says so) — the API pages oldest-first, so scanning from the front
-    would search only the stalest corner of a big object."""
+    would search only the stalest corner of a big object.
+
+    brief defaults FALSE here on purpose: brief strips DETAILS and CUSTOMFIELDS, and those
+    are exactly where a stray mention tends to hide, so a brief scan would quietly fail to
+    match. Pass brief=true only when you know the term is in a top-level field and want the
+    sweep to be cheaper."""
     err = await _ensure(ctx)
     if err:
         return {"error": err}
@@ -1290,9 +1520,11 @@ async def filter_records(object: str, contains: str, ctx: Context, field_name: O
         return res
     needle = (contains or "").lower()
     hits = [r for r in res["items"] if _record_contains(r, needle, field_name)]
-    return {"items": _sort_newest(hits), "matched": len(hits),
-            "scanned": res.get("total_fetched", 0), "scanned_from": "newest",
-            "truncated": res.get("truncated", False)}
+    hits = _sort_newest(hits)
+    return _fit(hits, {"matched": len(hits), "scanned": res.get("total_fetched", 0),
+                       "scanned_from": "newest", "searched_fields": "every field" if not brief
+                       else "top-level fields only (brief=true skips DETAILS/CUSTOMFIELDS)",
+                       "truncated": res.get("truncated", False)})
 
 _SUMMARY_OBJECTS = ["Contacts", "Organisations", "Leads", "Opportunities", "Projects",
                     "Tasks", "Events", "Notes", "Emails", "Ticket", "Product",
@@ -1617,10 +1849,15 @@ def task_result(task_id: str, top: int = 100, skip: int = 0) -> Any:
     page = min(max(int(top), 1), PAGE_MAX)
     start = max(int(skip), 0)
     window = items[start:start + page]
-    return {"items": window, "returned": len(window), "skip": start, "top": page,
-            "has_more": start + len(window) < len(items),
-            "next_skip": start + len(window), "count": len(items),
-            "status": rec["status"], "summary": rec["summary"]}
+    env = _fit(window, {"returned": len(window), "skip": start, "top": page,
+                        "has_more": start + len(window) < len(items),
+                        "next_skip": start + len(window), "count": len(items),
+                        "status": rec["status"], "summary": rec["summary"]})
+    if env.get("capped"):        # keep paging coherent after a trim
+        env["returned"] = len(env["items"])
+        env["next_skip"] = start + len(env["items"])
+        env["has_more"] = env["next_skip"] < len(items)
+    return env
 
 @mcp.tool()
 def list_tasks() -> Any:

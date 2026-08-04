@@ -399,6 +399,81 @@ def part6_newest() -> None:
     s.close()
 
 
+def part7_payload() -> None:
+    """brief must actually be brief, results must never exceed the host's 1MB ceiling, and
+    a final list must still carry custom fields."""
+    print("\n7. payload size, brief, and hydration")
+    s = Server(capabilities={})
+    HEAVY = ("CUSTOMFIELDS", "DETAILS", "ETag", "IMAGE_URL", "BODY")
+
+    thin = s.call("list_records", {"object": "Contacts", "top": 20, "brief": True})
+    fat = s.call("list_records", {"object": "Contacts", "top": 20, "brief": False})
+    ti, fi = thin.get("items", []), fat.get("items", [])
+    left = sorted({k for r in ti for k in r if k.upper() in [h.upper() for h in HEAVY]})
+    check("brief drops the bulky fields (case-insensitively)", not left, f"still present: {left}")
+    check("brief=false keeps them", any(k.upper() in [h.upper() for h in HEAVY]
+                                       for r in fi for k in r))
+    if ti and fi:
+        tb, fb = len(json.dumps(ti)), len(json.dumps(fi))
+        check("brief is materially smaller", tb < fb, f"{tb:,} vs {fb:,} bytes ({fb/max(tb,1):.1f}x)")
+
+    big = s.call("list_records", {"object": "Contacts", "fetch_all": True, "brief": False,
+                                 "max_records": 500})
+    check("no live result exceeds the host ceiling", len(json.dumps(big)) <= 1_000_000,
+          f"{len(json.dumps(big)):,} bytes (this env is too small to force a cap)")
+
+    # Exercise the trim directly — a small test env cannot produce a 1MB payload, and this
+    # guard is worthless if it is never actually run.
+    sys.path.insert(0, os.path.dirname(HERE))
+    import insightly_mcp as srv
+    fake = [{"id": i, "blob": "x" * 2000} for i in range(2000)]
+    trimmed = srv._fit(list(fake), {"total": len(fake)})
+    kept = len(trimmed.get("items", []))
+    check("_fit trims an oversized payload instead of letting it be rejected",
+          trimmed.get("capped") is True and 0 < kept < len(fake)
+          and len(json.dumps(trimmed)) <= 1_000_000,
+          f"kept {kept} of {len(fake)}, {len(json.dumps(trimmed)):,} bytes")
+    check("the cap explains itself and says how to page",
+          "1MB" in trimmed.get("capped_note", "") and "brief" in trimmed.get("capped_note", ""))
+    check("a payload that fits is passed through untouched",
+          "capped" not in srv._fit([{"a": 1}], {"total": 1}))
+
+    nr = s.call("newest_records", {"object": "Contacts", "top": 5})
+    check("a final list is hydrated back to full records",
+          any("CUSTOMFIELDS" in r for r in nr.get("items", [])), nr.get("detail_level"))
+
+    nb = s.call("newest_by", {"object": "Opportunities", "date_field": "ACTUAL_CLOSE_DATE",
+                              "top": 10})
+    cost = nb.get("cost", {})
+    check("newest_by ranks on an arbitrary date field",
+          nb.get("returned", 0) > 0 and nb.get("date_field") == "ACTUAL_CLOSE_DATE",
+          f"complete={nb.get('complete')} probes={cost.get('count_probes')} "
+          f"fetched={cost.get('records_fetched')}")
+    items = nb.get("items", [])
+    vals = [str(r.get("ACTUAL_CLOSE_DATE")) for r in items]
+    check("newest_by returns newest first", vals == sorted(vals, reverse=True))
+    check("newest_by reports what it cost", "records_fetched" in cost and "count_probes" in cost)
+    fwd = s.call("newest_by", {"object": "Opportunities",
+                               "date_field": "FORECAST_CLOSE_DATE", "top": 5})
+    check("a future-dated field is refused rather than answered wrongly",
+          bool(fwd.get("error")) and "future" in fwd["error"], str(fwd.get("error"))[:70])
+
+    orgs = [r["ORGANISATION_ID"] for r in s.call(
+        "list_records", {"object": "Organisations", "top": 5}).get("items", [])
+        if r.get("ORGANISATION_ID")]
+    rl = s.call("resolve_lookups", {"object": "Organisations", "ids": orgs})
+    check("resolve_lookups turns ids into names in one call",
+          rl.get("resolved") == len(orgs) and all(v for v in rl.get("names", {}).values()),
+          f"{list(rl.get('names', {}).items())[:2]}")
+    check("resolve_lookups returns names only, not whole records",
+          len(json.dumps(rl)) < 4000, f"{len(json.dumps(rl))} bytes for {len(orgs)} names")
+
+    f = s.call("filter_records", {"object": "Contacts", "contains": "a", "max_scan": 40})
+    check("filter_records searches every field by default",
+          f.get("searched_fields") == "every field", str(f.get("searched_fields")))
+    s.close()
+
+
 def part5_audit() -> None:
     print("\n5. swagger/API-doc audit fixes")
     s = Server(capabilities={})
@@ -474,6 +549,7 @@ def main() -> int:
     part4_apps()
     part5_audit()
     part6_newest()
+    part7_payload()
 
     failed = [r for r in results if r[0] == FAIL]
     print(f"\n=== {len(results) - len(failed)}/{len(results)} checks passed ===")
