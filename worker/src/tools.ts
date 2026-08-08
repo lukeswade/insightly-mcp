@@ -1,0 +1,716 @@
+/**
+ * The complete tool surface, ported from insightly_mcp.py v3.7.0 — same names, same
+ * descriptions (they encode usage guidance the model relies on), same result shapes.
+ *
+ * Environment-key management (connect / set_api_key / use_saved / list_saved /
+ * rename_saved / forget_saved / disconnect and the app_* env tools) is executed by the
+ * BRIDGE on the user's machine, where the keystore lives — keys never reach this worker's
+ * storage. The worker still ADVERTISES those tools (the host and the dashboard widget
+ * need them listed) and answers with guidance if one is ever called directly.
+ */
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/server";
+import { z } from "zod";
+import {
+  COMMON_OBJECTS, HYDRATE_MAX, Insightly, LINKABLE, NAME_FIELDS, PAGE_MAX, PK, SCAN_CAP,
+  applySort, briefStrip, fetchAll, fit, forwardDated, hydrate, mask, newestByField,
+  newestRecords, obj, pageEnvelope, pooled, recordContains, sortNewest,
+} from "./insightly";
+import { WIDGET_HTML } from "./widget";
+
+export const SERVER_VERSION = "4.0.0-cf";
+const UI_URI = "ui://insightly/env-dashboard.html";
+const SUMMARY_OBJECTS = ["Contacts", "Organisations", "Leads", "Opportunities", "Projects",
+  "Tasks", "Events", "Notes", "Emails", "Ticket", "Product", "KnowledgeArticle", "Users"];
+
+export interface WorkerSession { key: string | null; pod: string; envName: string | null; }
+
+const T = (payload: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(payload) }] });
+const uiMeta = (visibility: string[]) => ({
+  "ui/resourceUri": UI_URI, ui: { resourceUri: UI_URI, visibility } });
+
+const NOT_CONNECTED = {
+  error: "Not connected — no API key arrived with this request.",
+  hint: "Through the bridge: say \"switch to <env name>\" (use_saved) or set an API key in " +
+        "the extension settings. The key stays on your machine; it is sent per request and " +
+        "never stored by the server.",
+};
+const BRIDGE_MANAGED = (tool: string) => ({
+  error: `${tool} manages environment keys, which live on YOUR machine — the bridge ` +
+         "executes this tool locally and it should never reach the server.",
+  hint: "If you see this, the bridge version is too old for this server. Re-download the " +
+        "bridge .mcpb and reinstall.",
+});
+
+function writeHint(res: any, o: string): any {
+  if (res && typeof res === "object" && String(res.error ?? "").startsWith("HTTP 4")) {
+    res.hint = res.hint ?? `check field names, required fields and option values via describe_object('${o}')`;
+  }
+  return res;
+}
+
+async function describe(ins: Insightly, o: string): Promise<Record<string, any>> {
+  const out: Record<string, any> = { object: o, pk: PK[o] ?? null };
+  const [sample, cfs] = await Promise.all([
+    ins.request("GET", `/${o}`, { params: { top: 1, brief: "false" } }),
+    ins.request("GET", `/CustomFields/${o}`),
+  ]);
+  if (Array.isArray(sample) && sample.length && typeof sample[0] === "object") {
+    out.standard_fields = Object.keys(sample[0]).filter((k) => k !== "CUSTOMFIELDS" && k !== "ETag");
+  } else if (sample && sample.error) {
+    out.standard_fields_error = sample.error;
+  } else {
+    out.standard_fields = [];
+    out.note = "no records yet — standard fields unavailable from a sample.";
+  }
+  out.custom_fields = Array.isArray(cfs) ? cfs.filter((f) => f && typeof f === "object").map((f) => {
+    const c: Record<string, any> = { name: f.FIELD_NAME, label: f.FIELD_LABEL,
+                                     type: f.FIELD_TYPE, editable: f.EDITABLE };
+    const opts = (f.CUSTOM_FIELD_OPTIONS ?? []).map((op: any) => op?.OPTION_VALUE).filter(Boolean);
+    if (opts.length) c.options = opts;
+    if (f.JOIN_OBJECT) c.links_to = f.JOIN_OBJECT;
+    return c;
+  }) : [];
+  return out;
+}
+
+async function snapshot(ins: Insightly, s: WorkerSession): Promise<Record<string, any>> {
+  const counts: Record<string, any> = {};
+  const failed: Record<string, string> = {};
+  // 13 count probes in parallel — the laptop walks them one by one.
+  const results = await pooled(SUMMARY_OBJECTS.map((o) => () =>
+    ins.request("GET", `/${o}`, { params: { top: 1, brief: "true", count_total: "true" },
+                                  wantHeaders: true })));
+  SUMMARY_OBJECTS.forEach((o, i) => {
+    const [body, hdrs] = results[i] as [any, Record<string, string>];
+    if (body && !Array.isArray(body) && body.error) { failed[o] = body.error; return; }
+    const t = parseInt(hdrs?.["x-total-count"] ?? "", 10);
+    counts[o] = Number.isNaN(t) ? null : t;
+  });
+  const out: Record<string, any> = { connected_as: s.envName, pod: s.pod,
+                                     version: SERVER_VERSION, counts };
+  if (ins.quota.remaining !== null) {
+    out.daily_quota = { limit: ins.quota.limit, remaining: ins.quota.remaining };
+  }
+  if (Object.keys(failed).length) out.failed = failed;
+  return out;
+}
+
+export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
+    (env: any, sess: { key: string; pod: string }, payload: Record<string, unknown>) => Promise<any>): McpServer {
+  const server = new McpServer({ name: "insightly-se-mcp", version: SERVER_VERSION }, {
+    // 2026-era cache hints: the tool list is identical for every caller (public, 1h);
+    // field metadata differs per env key, so the resource template hints private below.
+    cacheHints: { "tools/list": { ttlMs: 3_600_000, cacheScope: "public" } },
+  } as any);
+  const ins = new Insightly({ key: s.key, pod: s.pod });
+  const ensure = () => (s.key ? null : NOT_CONNECTED);
+  const sess = () => ({ key: s.key as string, pod: s.pod });
+
+  // ------------------------------------------------------------------------ resources
+  server.registerResource("Insightly environment dashboard", UI_URI, {
+    title: "Insightly environment",
+    description: "Record counts across the connected Insightly demo environment.",
+    mimeType: "text/html;profile=mcp-app",
+    _meta: { ui: { prefersBorder: true } },
+  }, async () => ({
+    contents: [{ uri: UI_URI, mimeType: "text/html;profile=mcp-app", text: WIDGET_HTML }],
+  }));
+
+  server.registerResource("Insightly object fields",
+    new ResourceTemplate("insightly://{object}/fields", { list: undefined }), {
+      description: "Standard + custom field reference for one Insightly object " +
+        "(cacheable; per-connection, since custom fields differ per env).",
+      mimeType: "application/json",
+      cacheHint: { ttlMs: 300_000, cacheScope: "private" },
+    }, async (_uri: URL, vars: any) => {
+      const o = obj(String(vars?.object ?? _uri.hostname ?? ""));
+      const payload = ensure() ? { error: "not connected — the bridge supplies the key; " +
+        "switch to a saved env first, then read this resource again." } : await describe(ins, o);
+      return { contents: [{ uri: `insightly://${o}/fields`, mimeType: "application/json",
+                            text: JSON.stringify(payload) }] };
+    });
+
+  // ---------------------------------------------------------------- dashboard + counts
+  server.registerTool("env_dashboard", {
+    description: "Interactive dashboard of what's in the connected Insightly environment — " +
+      "record counts per object, with the day's remaining API quota. Same data as " +
+      "env_summary, rendered inline.",
+    inputSchema: z.object({}),
+    _meta: uiMeta(["model", "app"]),
+  }, async () => {
+    const e = ensure(); if (e) return T(e);
+    const snap = await snapshot(ins, s);
+    // Same graceful degradation as the local server: on a legacy handshake the
+    // extensions map is never negotiated, so name the host-version gap instead of
+    // returning bare numbers. (Hosts that render key on the tool _meta regardless.)
+    snap.ui = era === "modern" ? UI_URI
+      : "inline dashboard unavailable: this host negotiated a pre-2026-07-28 revision, " +
+        "and UI extensions are only advertised on MCP 2026-07-28 (stateless). These are " +
+        "exactly the numbers env_summary returns — nothing is broken.";
+    return T(snap);
+  });
+
+  server.registerTool("env_summary", {
+    description: "One-call overview of the connected environment: real record counts for the " +
+      "core objects. The perfect first call after connecting — \"what's in this env?\". For " +
+      "the same thing as an interactive dashboard, use env_dashboard.",
+    inputSchema: z.object({}),
+  }, async () => {
+    const e = ensure(); if (e) return T(e);
+    return T(await snapshot(ins, s));
+  });
+
+  server.registerTool("describe_object", {
+    description: "Field reference for an object: standard + custom fields with types, labels " +
+      "and valid dropdown options. Use before creating/updating records so values are valid.",
+    inputSchema: z.object({ object: z.string() }),
+  }, async ({ object }: any) => {
+    const e = ensure(); if (e) return T(e);
+    return T(await describe(ins, obj(object)));
+  });
+
+  // ------------------------------------------------------------------------- reads
+  server.registerTool("list_records", {
+    description: "List records for an object (e.g. 'Contacts'). Returns a paginated envelope: " +
+      "{items, returned, skip, top, has_more, next_skip[, total]}.\n" +
+      "- brief defaults True (drops bulky fields — far smaller). Pass brief=false for every field.\n" +
+      "- Paging: default top=100 (max 500). If has_more, call again with next_skip — OR pass " +
+      "fetch_all=true (default 500 records, hard cap 5000, pages fetched in parallel).\n" +
+      "- count_total=true adds the real `total` (X-Total-Count).\n" +
+      "- updated_after_utc: NOTE the list endpoint ignores this filter; search_records applies it for real.\n" +
+      "- order_by like 'DATE_UPDATED_UTC desc' sorts the RETURNED records CLIENT-SIDE.\n" +
+      "For the newest records use newest_records — records come back in ascending id order, " +
+      "so page 1 is the OLDEST. For finding records prefer search_records / filter_records.",
+    inputSchema: z.object({
+      object: z.string(), top: z.number().int().optional(), skip: z.number().int().optional(),
+      brief: z.boolean().optional(), order_by: z.string().optional(),
+      updated_after_utc: z.string().optional(), count_total: z.boolean().optional(),
+      fetch_all: z.boolean().optional(), max_records: z.number().int().optional(),
+    }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const o = obj(a.object);
+    if (a.fetch_all) {
+      const res = await fetchAll(ins, o, { brief: a.brief ?? true,
+        updatedAfterUtc: a.updated_after_utc, maxRecords: a.max_records ?? 500 });
+      let items = res.items;
+      delete res.items;
+      if (a.order_by) items = applySort(items, a.order_by);
+      return T(fit(items, res));
+    }
+    const page = Math.min(Math.max(a.top ?? 100, 1), PAGE_MAX);
+    const params: Record<string, unknown> = { top: page, skip: Math.max(a.skip ?? 0, 0),
+      brief: String(a.brief ?? true) };
+    if (a.updated_after_utc) params.updated_after_utc = a.updated_after_utc;
+    if (a.count_total) params.count_total = "true";
+    const [body, hdrs] = await ins.request("GET", `/${o}`, { params, wantHeaders: true });
+    if (body && !Array.isArray(body) && body.error) {
+      if (String(body.error).startsWith("HTTP 4")) {
+        body.hint = "check the object name via list_supported_objects; some objects aren't listable via GET.";
+      }
+      return T(body);
+    }
+    let items = Array.isArray(body) ? body : [];
+    if (a.brief ?? true) briefStrip(items);
+    if (a.order_by) items = applySort(items, a.order_by);
+    const envl = pageEnvelope(items, Math.max(a.skip ?? 0, 0), page);
+    if (a.count_total) {
+      const t = parseInt(hdrs?.["x-total-count"] ?? "", 10);
+      if (!Number.isNaN(t)) envl.total = t;
+    }
+    const its = envl.items; delete envl.items;
+    return T(fit(its, envl));
+  });
+
+  server.registerTool("newest_records", {
+    description: "The most recently created or updated records for an object, newest first.\n" +
+      "Use this for \"latest\", \"recent\" or \"newest\" questions. list_records cannot answer " +
+      "them: the API returns records in ascending id order and has no sort parameter, so its " +
+      "first page is the OLDEST records. This walks /{Object}/Search — which does honour a " +
+      "date filter — or reads the whole object when it is small enough, then ranks by the " +
+      "later of DATE_CREATED_UTC and DATE_UPDATED_UTC. The `basis` field says which.",
+    inputSchema: z.object({ object: z.string(), top: z.number().int().optional() }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const o = obj(a.object);
+    const want = Math.min(Math.max(a.top ?? 25, 1), SCAN_CAP);
+    const [items, total, basis] = await newestRecords(ins, o, want);
+    if (items && !Array.isArray(items) && items.error) return T(items);
+    const [full, note] = await hydrate(ins, o, items as any[]);
+    const out: Record<string, any> = { returned: full.length, detail_level: note,
+      sorted_by: "most recently created or updated, newest first", basis };
+    if (total !== null) out.total = total;
+    return T(fit(full, out));
+  });
+
+  server.registerTool("newest_by", {
+    description: "Latest records by ANY date field — \"the 50 most recently closed opportunities\".\n" +
+      "Use this whenever the ranking field is not the created/updated stamp, e.g. " +
+      "newest_by('Opportunities', 'ACTUAL_CLOSE_DATE'). It does NOT scan the object: it prices " +
+      "a change window with one-record count probes, fetches only that window, ranks inside it, " +
+      "and reports the cost. `complete: true` means the answer is provably the true top N.\n" +
+      "Only works for fields that cannot postdate a record's last update. Forecast/due/renewal " +
+      "dates are rejected — export instead. Returned records are hydrated to full detail.",
+    inputSchema: z.object({ object: z.string(), date_field: z.string(),
+                            top: z.number().int().optional() }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const field = String(a.date_field ?? "").trim().toUpperCase();
+    if (!field) return T({ error: "date_field is required, e.g. 'ACTUAL_CLOSE_DATE'." });
+    if (forwardDated(field)) {
+      return T({ error: `${field} can hold future dates, so it cannot be bounded by a change ` +
+        "window — the ranking would be silently incomplete.",
+        hint: "Rank on a field that is written when the event happens (ACTUAL_CLOSE_DATE, " +
+          "DATE_CREATED_UTC), or run start_export and rank the exported records." });
+    }
+    return T(await newestByField(ins, obj(a.object), field,
+                                 Math.min(Math.max(a.top ?? 50, 1), HYDRATE_MAX)));
+  });
+
+  server.registerTool("search_records", {
+    description: "EXACT-match search on a single field (the API does not do partial match here), " +
+      "e.g. search_records('Contacts', 'EMAIL_ADDRESS', 'jane@example.com'). Works on standard " +
+      "AND custom fields (use the custom FIELD_NAME, e.g. 'Intake_Status__c'). For substring " +
+      "matching use filter_records. Supports count_total and updated_after_utc.",
+    inputSchema: z.object({
+      object: z.string(), field_name: z.string(), field_value: z.string(),
+      top: z.number().int().optional(), skip: z.number().int().optional(),
+      count_total: z.boolean().optional(), updated_after_utc: z.string().optional(),
+      brief: z.boolean().optional(),
+    }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const page = Math.min(Math.max(a.top ?? 20, 1), PAGE_MAX);
+    const params: Record<string, unknown> = { field_name: a.field_name, field_value: a.field_value,
+      top: page, skip: Math.max(a.skip ?? 0, 0), brief: String(a.brief ?? true) };
+    if (a.updated_after_utc) params.updated_after_utc = a.updated_after_utc;
+    if (a.count_total) params.count_total = "true";
+    const [body, hdrs] = await ins.request("GET", `/${obj(a.object)}/Search`,
+                                           { params, wantHeaders: true });
+    if (body && !Array.isArray(body) && body.error) return T(body);
+    const items = Array.isArray(body) ? body : [];
+    if (a.brief ?? true) briefStrip(items);
+    const envl = pageEnvelope(items, Math.max(a.skip ?? 0, 0), page);
+    if (a.count_total) {
+      const t = parseInt(hdrs?.["x-total-count"] ?? "", 10);
+      if (!Number.isNaN(t)) envl.total = t;
+    }
+    const its = envl.items; delete envl.items;
+    return T(fit(its, envl));
+  });
+
+  server.registerTool("find_by_email", {
+    description: "Convenience: find records by exact email address (e.g. Contacts, Leads). " +
+      "Shortcut for search_records on EMAIL_ADDRESS.",
+    inputSchema: z.object({ object: z.string(), email: z.string() }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const body = await ins.request("GET", `/${obj(a.object)}/Search`,
+      { params: { field_name: "EMAIL_ADDRESS", field_value: a.email, top: 20 } });
+    if (body && !Array.isArray(body) && body.error) return T(body);
+    return T(pageEnvelope(Array.isArray(body) ? body : [], 0, 20));
+  });
+
+  server.registerTool("filter_records", {
+    description: "CONTAINS filter, done CLIENT-SIDE because Insightly's search is exact-match " +
+      "only. Scans up to max_scan records (default 1000, hard cap 5000) and returns those " +
+      "matching `contains` (case-insensitive) — in `field_name` if given, otherwise in ANY " +
+      "top-level field. If the object holds more than max_scan records the scan covers the " +
+      "NEWEST max_scan of them. brief defaults FALSE here on purpose: brief strips DETAILS and " +
+      "CUSTOMFIELDS, exactly where a stray mention tends to hide.",
+    inputSchema: z.object({
+      object: z.string(), contains: z.string(), field_name: z.string().optional(),
+      brief: z.boolean().optional(), max_scan: z.number().int().optional(),
+    }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const res = await fetchAll(ins, obj(a.object), { brief: a.brief ?? false,
+      maxRecords: a.max_scan ?? 1000, newestFirst: true });
+    if (res.error && !(res.items as any[])?.length) return T(res);
+    const needle = String(a.contains ?? "").toLowerCase();
+    const hits = sortNewest((res.items as any[]).filter((r) => recordContains(r, needle, a.field_name)));
+    return T(fit(hits, { matched: hits.length, scanned: res.total_fetched,
+      scanned_from: "newest",
+      searched_fields: (a.brief ?? false)
+        ? "top-level fields only (brief=true skips DETAILS/CUSTOMFIELDS)" : "every field",
+      truncated: res.truncated }));
+  });
+
+  server.registerTool("get_record", {
+    description: "Fetch one record by id, e.g. get_record('Contacts', 12345). Shows field names.",
+    inputSchema: z.object({ object: z.string(), record_id: z.number().int() }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    return T(await ins.request("GET", `/${obj(a.object)}/${a.record_id}`));
+  });
+
+  server.registerTool("resolve_lookups", {
+    description: "Turn a list of record ids into {id: name} — for the ORGANISATION_ID / " +
+      "CONTACT_ID style lookup fields that come back as bare numbers. One tool call returns " +
+      "just the names instead of dozens of full records. Unknown ids come back under `missing`.",
+    inputSchema: z.object({ object: z.string(), ids: z.array(z.number().int()) }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const o = obj(a.object);
+    const wanted = [...new Set((a.ids ?? []).map((i: any) => Math.trunc(i)))].slice(0, HYDRATE_MAX);
+    if (!wanted.length) return T({ error: "ids is required (a list of record ids)." });
+    const names: Record<string, any> = {};
+    const missing: number[] = [];
+    // Parallel: the whole point of this tool is turning N round-trips into one call.
+    const recs = await pooled(wanted.map((rid) => () => ins.request("GET", `/${o}/${rid}`)));
+    wanted.forEach((rid, i) => {
+      const rec = recs[i];
+      if (!rec || typeof rec !== "object" || rec.error) { missing.push(rid as number); return; }
+      let label = NAME_FIELDS.map((f) => rec[f]).find(Boolean) ?? null;
+      if (label === null) {
+        label = ["FIRST_NAME", "LAST_NAME"].map((f) => rec[f]).filter(Boolean).join(" ") || null;
+      }
+      names[String(rid)] = label;
+    });
+    const out: Record<string, any> = { object: o, pk: PK[o] ?? null, names,
+      resolved: Object.keys(names).length, requested: wanted.length };
+    if (missing.length) out.missing = missing;
+    if ((a.ids ?? []).length > HYDRATE_MAX) {
+      out.note = `Only the first ${HYDRATE_MAX} ids were resolved — each one costs an API ` +
+        "call. Call again with the rest if you need them.";
+    }
+    return T(out);
+  });
+
+  // ------------------------------------------------------------------------- writes
+  server.registerTool("create_record", {
+    description: "Create a record. `fields` = API field names → values, e.g. " +
+      "create_record('Contacts', {'FIRST_NAME':'Jane','LAST_NAME':'Doe'}).",
+    inputSchema: z.object({ object: z.string(), fields: z.record(z.string(), z.any()) }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const o = obj(a.object);
+    return T(writeHint(await ins.request("POST", `/${o}`, { body: a.fields }), o));
+  });
+
+  server.registerTool("create_records", {
+    description: "Batch-create up to 50 records in one call (rate-paced) — ideal for demo " +
+      "seeding. `records` is a list of `fields` dicts as in create_record. Continues past " +
+      "individual failures. Returns {created, failed, ids, errors}. For bigger batches use " +
+      "start_bulk_create.",
+    inputSchema: z.object({ object: z.string(), records: z.array(z.record(z.string(), z.any())) }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    if (!Array.isArray(a.records) || !a.records.length) {
+      return T({ error: "pass a non-empty list of field dicts." });
+    }
+    const o = obj(a.object);
+    const batch = a.records.slice(0, 50);
+    const pk = PK[o];
+    const ids: any[] = [];
+    const errors: any[] = [];
+    const results: any[] = await pooled(batch.map((fields: any) => () =>
+      ins.request("POST", `/${o}`, { body: fields })), 4);
+    results.forEach((res: any, i: number) => {
+      if (res && res.error) errors.push({ index: i, error: res.error });
+      else ids.push(pk && res && typeof res === "object" ? res[pk] : null);
+    });
+    const out: Record<string, any> = { created: ids.length, failed: errors.length, ids, errors };
+    if (a.records.length > 50) out.note = "only the first 50 were created — use start_bulk_create for more.";
+    return T(out);
+  });
+
+  server.registerTool("update_record", {
+    description: "Partial update (send only changed fields). PK is filled in for common " +
+      "objects. Optimistic concurrency: pass the record's `ETag` as `if_match`, or safe=true " +
+      "to fetch the current ETag first. On a stale ETag Insightly answers **400**, not the " +
+      "documented 412 (verified live).",
+    inputSchema: z.object({
+      object: z.string(), record_id: z.number().int(), fields: z.record(z.string(), z.any()),
+      if_match: z.string().optional(), safe: z.boolean().optional(),
+    }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const o = obj(a.object);
+    const body: Record<string, any> = { ...a.fields };
+    const pk = PK[o];
+    if (pk) body[pk] = body[pk] ?? a.record_id;
+    else if (!Object.keys(body).some((k) => k.toUpperCase().endsWith("_ID"))) {
+      return T({ error: `unknown primary key for '${o}' — include its *_ID field in \`fields\`.` });
+    }
+    let tag = a.if_match;
+    if (a.safe && !tag) {
+      const cur = await ins.request("GET", `/${o}/${a.record_id}`);
+      if (cur && cur.error) return T({ error: `couldn't read the current record to get its ETag: ${cur.error}` });
+      tag = cur?.ETag;
+      if (!tag) return T({ error: "safe=true but this record has no ETag to compare against." });
+    }
+    return T(writeHint(await ins.request("PUT", `/${o}`, { body,
+      headers: tag ? { "If-Match": tag } : undefined }), o));
+  });
+
+  server.registerTool("delete_record", {
+    description: "PERMANENTLY delete a record. Must pass confirm=true.",
+    inputSchema: z.object({ object: z.string(), record_id: z.number().int(),
+                            confirm: z.boolean().optional() }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    if (!a.confirm) return T({ error: "destructive — pass confirm=true to actually delete this record." });
+    return T(await ins.request("DELETE", `/${obj(a.object)}/${a.record_id}`) ?? { ok: true });
+  });
+
+  server.registerTool("add_note", {
+    description: "Attach a note to a record (Contacts, Organisations, Opportunities, Projects, Leads).",
+    inputSchema: z.object({ parent_object: z.string(), parent_id: z.number().int(),
+                            title: z.string(), body: z.string().optional() }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    return T(await ins.request("POST", `/${obj(a.parent_object)}/${a.parent_id}/Notes`,
+      { body: { TITLE: a.title, BODY: a.body ?? "" } }));
+  });
+
+  // -------------------------------------------------------------------------- links
+  server.registerTool("list_links", {
+    description: "Show what a record is linked to (linked contacts, organisations, opportunities…).",
+    inputSchema: z.object({ object: z.string(), record_id: z.number().int() }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const o = obj(a.object);
+    if (!LINKABLE.includes(o)) {
+      return T({ error: `'${o}' has no Links endpoint. Linkable objects: ${LINKABLE.join(", ")}.` });
+    }
+    return T(await ins.request("GET", `/${o}/${a.record_id}/Links`));
+  });
+
+  server.registerTool("link_records", {
+    description: "Link two records, e.g. put a contact into an organisation: " +
+      "link_records('Contacts', 123, 'Organisation', 456). `link_object_name` is the SINGULAR " +
+      "object name. Both ids must already exist.",
+    inputSchema: z.object({
+      object: z.string(), record_id: z.number().int(), link_object_name: z.string(),
+      link_object_id: z.number().int(), role: z.string().optional(), details: z.string().optional(),
+    }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const o = obj(a.object);
+    if (!LINKABLE.includes(o)) {
+      return T({ error: `'${o}' has no Links endpoint. Linkable objects: ${LINKABLE.join(", ")}.` });
+    }
+    const body: Record<string, any> = { LINK_OBJECT_NAME: a.link_object_name.trim(),
+                                        LINK_OBJECT_ID: a.link_object_id };
+    if (a.role) body.ROLE = a.role;
+    if (a.details) body.DETAILS = a.details;
+    const res = await ins.request("POST", `/${o}/${a.record_id}/Links`, { body });
+    if (res && typeof res === "object" && String(res.error ?? "").startsWith("HTTP 4")) {
+      res.hint = res.hint ?? "check both ids exist and that LINK_OBJECT_NAME is the SINGULAR " +
+        "object name (e.g. 'Organisation', not 'Organisations').";
+    }
+    return T(res);
+  });
+
+  server.registerTool("unlink_records", {
+    description: "Remove a link (get link_id from list_links). Must pass confirm=true.",
+    inputSchema: z.object({ object: z.string(), record_id: z.number().int(),
+                            link_id: z.number().int(), confirm: z.boolean().optional() }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    if (!a.confirm) return T({ error: "pass confirm=true to remove this link." });
+    const o = obj(a.object);
+    if (!LINKABLE.includes(o)) {
+      return T({ error: `'${o}' has no Links endpoint. Linkable objects: ${LINKABLE.join(", ")}.` });
+    }
+    return T(await ins.request("DELETE", `/${o}/${a.record_id}/Links/${a.link_id}`) ?? { ok: true });
+  });
+
+  // ---------------------------------------------------------------- background tasks
+  server.registerTool("start_export", {
+    description: "Export an ENTIRE object in the background — no 5,000-record cap. Returns a " +
+      "task_id immediately; poll with task_status(task_id) and read pages with " +
+      "task_result(task_id). Use this instead of list_records(fetch_all=true) for big environments.",
+    inputSchema: z.object({ object: z.string(), brief: z.boolean().optional(),
+      updated_after_utc: z.string().optional(), max_records: z.number().int().optional() }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const o = obj(a.object);
+    const r = await taskCall(env, sess(), { op: "start_export", detail: o,
+      params: { o, brief: a.brief ?? true, updatedAfterUtc: a.updated_after_utc ?? null,
+                cap: Math.min(Math.max(a.max_records ?? 100_000, 1), 250_000) } });
+    if (r.error) return T(r);
+    return T({ task_id: r.task_id, status: r.status, poll_interval_ms: 500,
+      next: `task_status('${r.task_id}') until status=completed, then task_result('${r.task_id}')` });
+  });
+
+  server.registerTool("start_bulk_create", {
+    description: "Create ANY number of records in the background — no 50-per-call cap. Returns " +
+      "a task_id immediately; poll with task_status(task_id). Use create_records for small batches.",
+    inputSchema: z.object({ object: z.string(), records: z.array(z.record(z.string(), z.any())) }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    if (!Array.isArray(a.records) || !a.records.length) {
+      return T({ error: "pass a non-empty list of field dicts." });
+    }
+    const o = obj(a.object);
+    const r = await taskCall(env, sess(), { op: "start_bulk", detail: `${o} × ${a.records.length}`,
+      params: { o }, records: a.records });
+    if (r.error) return T(r);
+    return T({ task_id: r.task_id, status: r.status, queued: a.records.length,
+      poll_interval_ms: 500, next: `task_status('${r.task_id}')` });
+  });
+
+  server.registerTool("task_status", {
+    description: "Progress of a background task: status (working/completed/failed/cancelled), " +
+      "progress, total, and a summary once finished.",
+    inputSchema: z.object({ task_id: z.string() }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    return T(await taskCall(env, sess(), { op: "status", task_id: a.task_id }));
+  });
+
+  server.registerTool("task_result", {
+    description: "Read a finished task's records, PAGED (default 100 at a time). Returns " +
+      "{items, returned, skip, top, has_more, next_skip, count}.",
+    inputSchema: z.object({ task_id: z.string(), top: z.number().int().optional(),
+                            skip: z.number().int().optional() }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    return T(await taskCall(env, sess(), { op: "result", task_id: a.task_id,
+                                           top: a.top ?? 100, skip: a.skip ?? 0 }));
+  });
+
+  server.registerTool("list_tasks", {
+    description: "All background tasks for this environment's key, newest first.",
+    inputSchema: z.object({}),
+  }, async () => {
+    const e = ensure(); if (e) return T(e);
+    return T(await taskCall(env, sess(), { op: "list" }));
+  });
+
+  server.registerTool("cancel_task", {
+    description: "Stop a running background task.",
+    inputSchema: z.object({ task_id: z.string() }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    return T(await taskCall(env, sess(), { op: "cancel", task_id: a.task_id }));
+  });
+
+  // -------------------------------------------------------------- session / meta tools
+  server.registerTool("connection_info", {
+    description: "Show whether this connection is authenticated, which org/pod it points at, " +
+      "the server version, and the LIVE remaining daily API quota (read from a one-record probe).",
+    inputSchema: z.object({}),
+  }, async () => {
+    const out: Record<string, any> = { connected: !!s.key, as: s.envName, pod: s.pod,
+      read_only: false, version: SERVER_VERSION, served_from: "cloudflare-worker" };
+    if (s.key) {
+      await ins.request("GET", "/Instance", { params: { top: 1 } });
+      if (ins.quota.limit !== null) {
+        out.daily_quota = { limit: ins.quota.limit, remaining: ins.quota.remaining,
+                            as_of: new Date().toISOString() };
+      }
+    }
+    return T(out);
+  });
+
+  server.registerTool("list_supported_objects", {
+    description: "Insightly object names this server knows. Names are normalised automatically " +
+      "(the API is inconsistent: Ticket/Product/Quotation/Pricebook are singular, the rest " +
+      "plural; 'Organizations' US spelling also accepted). Anything else via raw_request.",
+    inputSchema: z.object({}),
+  }, async () => T({ objects: COMMON_OBJECTS, read_only: false, version: SERVER_VERSION }));
+
+  server.registerTool("raw_request", {
+    description: "Escape hatch — any endpoint. `path` is relative to the v3.1 base, e.g. " +
+      "'/Opportunities/123/Tasks'.",
+    inputSchema: z.object({ method: z.string(), path: z.string(),
+      query: z.record(z.string(), z.any()).optional(),
+      body: z.record(z.string(), z.any()).optional() }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    return T(await ins.request(a.method, "/" + String(a.path).replace(/^\/+/, ""),
+                               { params: a.query, body: a.body }));
+  });
+
+  // Environment-key tools: executed by the bridge on the user's machine. Advertised here
+  // (the host needs them in tools/list) but never legitimately executed server-side.
+  const bridgeTools: Array<[string, string, object]> = [
+    ["connect", "Authenticate / switch Insightly org. (Executed locally by the bridge — keys stay on your machine.)", z.object({})],
+    ["set_api_key", "Set the API key without a prompt (non-interactive clients). Executed locally by the bridge.", z.object({ api_key: z.string(), pod: z.string().optional(), save_as: z.string().optional() })],
+    ["disconnect", "Clear the in-memory key for this session (does not delete saved keys). Executed locally by the bridge.", z.object({})],
+    ["use_saved", "Switch to a saved environment by name (key never enters the chat). Executed locally by the bridge.", z.object({ name: z.string() })],
+    ["list_saved", "List locally-saved keys (masked). Executed locally by the bridge.", z.object({})],
+    ["rename_saved", "Rename a saved environment (key untouched). Executed locally by the bridge.", z.object({ name: z.string(), new_name: z.string() })],
+    ["forget_saved", "Delete a saved key by name. Executed locally by the bridge.", z.object({ name: z.string() })],
+  ];
+  for (const [name, description, schema] of bridgeTools) {
+    server.registerTool(name, { description, inputSchema: schema as any },
+      async () => T(BRIDGE_MANAGED(name)));
+  }
+
+  // ------------------------------------------------------------------ app-only tools
+  server.registerTool("app_records", {
+    description: "(dashboard) newest records for one object, for the drill-in panel.",
+    inputSchema: z.object({ object: z.string(), top: z.number().int().optional(),
+                            order_by: z.string().optional() }),
+    _meta: uiMeta(["app"]),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const o = obj(a.object);
+    const page = Math.min(Math.max(a.top ?? 25, 1), SCAN_CAP);
+    const [items, total, basis] = await newestRecords(ins, o, page);
+    if (items && !Array.isArray(items) && items.error) return T(items);
+    let rows = items as any[];
+    if (a.order_by) rows = applySort(rows, a.order_by);
+    const out: Record<string, any> = { returned: rows.length,
+      sorted_by: a.order_by ?? "most recently created or updated, newest first",
+      basis, top: page, skip: 0 };
+    if (total !== null) out.total = total;
+    out.has_more = total !== null && total > rows.length;
+    return T(fit(rows, out));
+  });
+
+  server.registerTool("app_fields", {
+    description: "(dashboard) field list for one object.",
+    inputSchema: z.object({ object: z.string() }),
+    _meta: uiMeta(["app"]),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    return T(await describe(ins, obj(a.object)));
+  });
+
+  server.registerTool("app_custom_objects", {
+    description: "(dashboard) custom object definitions + how many records each holds.",
+    inputSchema: z.object({ with_counts: z.boolean().optional() }),
+    _meta: uiMeta(["app"]),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const defs = await ins.request("GET", "/CustomObjects", { params: { top: 200 } });
+    if (defs && !Array.isArray(defs) && defs.error) return T(defs);
+    const rows = (Array.isArray(defs) ? defs : []).filter((d) => d && typeof d === "object");
+    const counts = (a.with_counts ?? true)
+      ? await pooled(rows.map((d) => async () => {
+          if (!d.OBJECT_NAME) return null;
+          const [, hdrs] = await ins.request("GET", `/${d.OBJECT_NAME}`, {
+            params: { top: 1, brief: "true", count_total: "true" }, wantHeaders: true });
+          const t = parseInt(hdrs?.["x-total-count"] ?? "", 10);
+          return Number.isNaN(t) ? null : t;
+        }))
+      : rows.map(() => null);
+    return T({ total: rows.length, custom_objects: rows.map((d, i) => ({
+      name: d.OBJECT_NAME,
+      label: d.PLURAL_LABEL || d.SINGULAR_LABEL || d.OBJECT_NAME,
+      singular: d.SINGULAR_LABEL, in_navbar: d.ENABLE_NAVBAR,
+      ...(a.with_counts ?? true ? { count: counts[i] } : {}),
+    })) });
+  });
+
+  const appEnvTools: Array<[string, string, object]> = [
+    ["app_envs", "(dashboard) saved environments and which one is active. Executed locally by the bridge.", z.object({})],
+    ["app_use_env", "(dashboard) switch to a saved environment by name. Executed locally by the bridge.", z.object({ name: z.string() })],
+    ["app_add_env", "(dashboard) verify + save a new environment. Executed locally by the bridge.", z.object({ name: z.string(), api_key: z.string(), pod: z.string().optional() })],
+    ["app_rename_env", "(dashboard) rename a saved environment. Executed locally by the bridge.", z.object({ name: z.string(), new_name: z.string() })],
+    ["app_remove_env", "(dashboard) remove a saved environment from this machine. Executed locally by the bridge.", z.object({ name: z.string() })],
+  ];
+  for (const [name, description, schema] of appEnvTools) {
+    server.registerTool(name, { description, inputSchema: schema as any, _meta: uiMeta(["app"]) },
+      async () => T(BRIDGE_MANAGED(name)));
+  }
+
+  return server;
+}
+
+export { mask };

@@ -1,0 +1,14 @@
+{
+  "name": "insightly-se-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "placement": { "mode": "smart" },
+  "durable_objects": {
+    "bindings": [{ "name": "TASKS", "class_name": "TaskDO" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["TaskDO"] }
+  ]
+}
