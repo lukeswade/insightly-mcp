@@ -1,26 +1,30 @@
 /**
- * Background tasks on a Durable Object — the one piece of the local server that could
- * not stay in-process (a stateless Worker forgets everything between requests).
+ * Background tasks on a Durable Object — exports, bulk-creates, streaming aggregations,
+ * and the query/CSV surface over completed exports.
  *
  * Isolation: the DO instance is addressed by a hash of (api key + pod), so each key sees
  * only its own tasks — necessary on a shared endpoint.
  *
- * Key custody: the API key is stored in the DO ONLY while a task is running (the alarm
- * needs it to keep paging with nobody connected) and is deleted the moment the task
- * reaches a terminal state. Task data itself is swept one hour after completion, matching
- * the local server's TTL.
+ * Key custody: the API key is stored ONLY while a task is running (the alarm needs it to
+ * keep paging with nobody connected) and is deleted the moment the task reaches a
+ * terminal state. Task data sweeps one hour after completion.
  *
- * Budget: each alarm tick spends at most ~36 upstream calls (6-wide × 6 rounds), safely
- * inside even the free-plan 50-subrequest ceiling, then re-arms itself one second out.
+ * Storage shape: records live in BYTE-BOUNDED chunks (~700KB serialized) with per-chunk
+ * row counts in meta.chunk_rows — a page of full Organisation records (100KB+ each) would
+ * blow a per-value limit if chunked by count. Aggregation tasks store no records at all:
+ * they stream pages through a group accumulator and persist only the running totals.
  */
-import { Insightly, PAGE_MAX, PK, briefStrip, fit, pooled } from "./insightly";
+import { Insightly, PAGE_MAX, PK, briefStrip, fit, pooled, projectAll } from "./insightly";
+import { GroupState, Metric, TopN, WhereClause, accumulate, finishGroups, getField,
+         matches, referencedFields, sortByField } from "./query";
 
 const TASK_POLL_MS = 500;
 const TASK_TTL_MS = 3600_000;
 const EXPORT_SAFETY_CAP = 250_000;
-const CHUNK = PAGE_MAX;            // one storage chunk per API page
-const PAGES_PER_TICK = 6;          // rounds of 6-wide fetches per alarm
+const CHUNK_BYTES = 700_000;
+const ROUNDS_PER_TICK = 6;         // waves of parallel pages per alarm
 const CREATES_PER_TICK = 30;
+const QUERY_TOP_CAP = 500;
 
 interface Meta {
   task_id: string; kind: string; detail: string;
@@ -30,6 +34,7 @@ interface Meta {
   progress: number; total: number | null;
   error: string | null; summary: any;
   cancel: boolean; chunks: number; count: number;
+  chunk_rows: number[];
   params: any;
   session?: { key: string; pod: string };   // present ONLY while status === "working"
 }
@@ -49,8 +54,14 @@ function pub(m: Meta, includeResult = false): Record<string, any> {
 
 const now = () => new Date().toISOString();
 
+function csvEscape(v: unknown): string {
+  if (v === null || v === undefined) return "";
+  const s = typeof v === "object" ? JSON.stringify(v) : String(v);
+  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
 export class TaskDO {
-  constructor(private state: DurableObjectState, private env: unknown) {}
+  constructor(private state: DurableObjectState, private env: any) {}
 
   private async meta(tid: string): Promise<Meta | undefined> {
     return await this.state.storage.get<Meta>(`meta:${tid}`);
@@ -69,28 +80,57 @@ export class TaskDO {
     await this.putMeta(m);
   }
 
+  /** Append rows as byte-bounded chunks. */
+  private async appendRows(m: Meta, rows: any[]): Promise<void> {
+    let buf: any[] = [];
+    let bytes = 2;
+    const flush = async () => {
+      if (!buf.length) return;
+      await this.state.storage.put(`chunk:${m.task_id}:${m.chunks}`, buf);
+      m.chunk_rows.push(buf.length);
+      m.chunks++; m.count += buf.length;
+      buf = []; bytes = 2;
+    };
+    for (const r of rows) {
+      const sz = JSON.stringify(r).length + 1;
+      if (buf.length && bytes + sz > CHUNK_BYTES) await flush();
+      buf.push(r); bytes += sz;
+    }
+    await flush();
+  }
+
+  /** Stream every stored row through a visitor, chunk by chunk. */
+  private async scan(m: Meta, visit: (rec: any) => void | boolean): Promise<void> {
+    for (let c = 0; c < m.chunks; c++) {
+      const rows = await this.state.storage.get<any[]>(`chunk:${m.task_id}:${c}`) ?? [];
+      for (const r of rows) if (visit(r) === false) return;
+    }
+  }
+
   async fetch(request: Request): Promise<Response> {
     const body: any = await request.json();
     const op = body.op as string;
     const respond = (x: unknown) => Response.json(x as any);
 
-    if (op === "start_export" || op === "start_bulk") {
+    if (op === "start_export" || op === "start_bulk" || op === "start_aggregate") {
       const tid = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+      const kind = op === "start_export" ? "export"
+        : op === "start_bulk" ? "bulk_create" : "aggregate";
       const m: Meta = {
-        task_id: tid, kind: op === "start_export" ? "export" : "bulk_create",
-        detail: body.detail, status: "working", status_message: "queued",
+        task_id: tid, kind, detail: body.detail, status: "working", status_message: "queued",
         created_at: now(), last_updated_at: now(), done_at: null,
         progress: 0, total: null, error: null, summary: null,
-        cancel: false, chunks: 0, count: 0, params: body.params,
+        cancel: false, chunks: 0, count: 0, chunk_rows: [], params: body.params,
         session: body.session,
       };
       if (op === "start_bulk") {
         const records: any[] = body.records ?? [];
         m.total = records.length;
-        for (let i = 0; i * CHUNK < records.length; i++) {
-          await this.state.storage.put(`bulkin:${tid}:${i}`, records.slice(i * CHUNK, (i + 1) * CHUNK));
+        for (let i = 0; i * PAGE_MAX < records.length; i++) {
+          await this.state.storage.put(`bulkin:${tid}:${i}`, records.slice(i * PAGE_MAX, (i + 1) * PAGE_MAX));
         }
       }
+      if (op === "start_aggregate") m.params.groups = {};
       await this.putMeta(m);
       await this.state.storage.setAlarm(Date.now() + 25);
       return respond({ task_id: tid, status: m.status });
@@ -111,13 +151,19 @@ export class TaskDO {
       }
       const page = Math.min(Math.max(Math.trunc(body.top ?? 100), 1), PAGE_MAX);
       const start = Math.max(Math.trunc(body.skip ?? 0), 0);
-      // Read only the chunks the window touches — a 167k-record export never fully loads.
-      const c0 = Math.floor(start / CHUNK), c1 = Math.floor((start + page - 1) / CHUNK);
-      const rows: any[] = [];
-      for (let c = c0; c <= c1 && c < m.chunks; c++) {
-        rows.push(...(await this.state.storage.get<any[]>(`chunk:${m.task_id}:${c}`) ?? []));
+      // Walk chunk_rows to the window — chunks are byte-bounded, not fixed-count.
+      const window: any[] = [];
+      let seen = 0;
+      for (let c = 0; c < m.chunks && window.length < page; c++) {
+        const rows = m.chunk_rows[c] ?? 0;
+        if (seen + rows <= start) { seen += rows; continue; }
+        const chunk = await this.state.storage.get<any[]>(`chunk:${m.task_id}:${c}`) ?? [];
+        for (const r of chunk) {
+          if (seen >= start && window.length < page) window.push(r);
+          seen++;
+          if (window.length >= page) break;
+        }
       }
-      const window = rows.slice(start - c0 * CHUNK, start - c0 * CHUNK + page);
       const env = fit(window, { returned: window.length, skip: start, top: page,
                                 has_more: start + window.length < m.count,
                                 next_skip: start + window.length, count: m.count,
@@ -130,9 +176,91 @@ export class TaskDO {
       return respond(env);
     }
 
+    if (op === "query") {
+      const m = await this.meta(body.task_id);
+      if (!m) return respond({ error: `unknown task_id '${body.task_id}'.` });
+      if (m.status === "working") {
+        return respond({ error: `the export is still running — status '${m.status}', ` +
+                                `progress ${m.progress}. Query it when completed.` });
+      }
+      const where: WhereClause[] | undefined = body.where;
+      const metrics: Metric[] = body.metrics ?? [];
+      const groupBy: string | undefined = body.group_by;
+      const fields: string[] | undefined = body.fields?.length ? body.fields : undefined;
+      const top = Math.min(Math.max(Math.trunc(body.top ?? 100), 1), QUERY_TOP_CAP);
+
+      if (groupBy !== undefined || metrics.length) {
+        const state: GroupState = {};
+        let matched = 0;
+        await this.scan(m, (rec) => {
+          if (!matches(rec, where)) return;
+          matched++;
+          accumulate(state, rec, groupBy, metrics.length ? metrics : [{ op: "count" }]);
+        });
+        const rows = finishGroups(state, groupBy, metrics.length ? metrics : [{ op: "count" }]);
+        return respond(fit(rows.slice(0, top), {
+          matched, scanned: m.count, groups: rows.length,
+          group_by: groupBy ?? null, source_task: m.task_id }));
+      }
+
+      let matched = 0;
+      let rows: any[];
+      if (body.order_by) {
+        const topn = new TopN(body.order_by, top);
+        await this.scan(m, (rec) => { if (matches(rec, where)) { matched++; topn.push(rec); } });
+        rows = topn.result();
+      } else {
+        rows = [];
+        await this.scan(m, (rec) => {
+          if (!matches(rec, where)) return;
+          matched++;
+          if (rows.length < top) rows.push(rec);
+        });
+      }
+      const o = String(m.params?.o ?? "");
+      if (fields) rows = projectAll(rows, fields, o);
+      return respond(fit(rows, { matched, scanned: m.count, returned: rows.length,
+        order_by: body.order_by ?? null, source_task: m.task_id,
+        note: matched > rows.length ? `showing ${rows.length} of ${matched} matches — ` +
+          "narrow with `where`, or raise `top` (cap 500)." : undefined }));
+    }
+
+    if (op === "csv") {
+      const m = await this.meta(body.task_id);
+      if (!m) return respond({ error: `unknown task_id '${body.task_id}'.` });
+      if (m.status === "working") {
+        return respond({ error: `the export is still running — progress ${m.progress}.` });
+      }
+      if (!this.env?.EXPORTS) return respond({ error: "no R2 bucket bound." });
+      // pass 1: the column set (standard keys + flattened custom names, bounded)
+      const cols: string[] = [];
+      const seen = new Set<string>();
+      await this.scan(m, (rec) => {
+        for (const k of Object.keys(rec)) {
+          if (k === "CUSTOMFIELDS" || k === "LINKS" || k === "ETag") continue;
+          if (!seen.has(k) && cols.length < 400) { seen.add(k); cols.push(k); }
+        }
+        for (const c of (Array.isArray(rec.CUSTOMFIELDS) ? rec.CUSTOMFIELDS : [])) {
+          const n = c?.FIELD_NAME;
+          if (n && !seen.has(n) && cols.length < 400) { seen.add(n); cols.push(n); }
+        }
+      });
+      // pass 2: the rows
+      const lines: string[] = [cols.map(csvEscape).join(",")];
+      await this.scan(m, (rec) => {
+        lines.push(cols.map((c) => csvEscape(getField(rec, c))).join(","));
+      });
+      const csv = lines.join("\r\n");
+      const key = `exports/${m.task_id}-${crypto.randomUUID().replace(/-/g, "")}.csv`;
+      await this.env.EXPORTS.put(key, csv, {
+        httpMetadata: { contentType: "text/csv",
+                        contentDisposition: `attachment; filename="${m.detail || "export"}-${m.task_id}.csv"` } });
+      return respond({ key, rows: m.count, columns: cols.length, bytes: csv.length });
+    }
+
     if (op === "list") {
       const metas = await this.state.storage.list<Meta>({ prefix: "meta:" });
-      const tasks = [...metas.values()].map((m) => pub(m, true))
+      const tasks = [...metas.values()].map((mm) => pub(mm, true))
         .sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
       return respond({ tasks });
     }
@@ -177,42 +305,68 @@ export class TaskDO {
     if (!m.session) { await this.finish(m, "failed", "session lost"); return; }
     const ins = new Insightly({ key: m.session.key, pod: m.session.pod });
 
-    if (m.kind === "export") {
+    if (m.kind === "export" || m.kind === "aggregate") {
       const { o, brief, updatedAfterUtc, cap } = m.params;
+      // Full records of heavy objects (Organisations!) run 100KB+ each — smaller pages
+      // keep each parse and each storage write inside sane bounds.
+      const pageSize = brief ? PAGE_MAX : 200;
       if (m.total === null) {
         const [, hdrs] = await ins.request("GET", `/${o}`, {
           params: { top: 1, brief: "true", count_total: "true" }, wantHeaders: true });
         const t = parseInt(hdrs?.["x-total-count"] ?? "", 10);
         m.total = Number.isNaN(t) ? null : Math.min(t, cap);
       }
-      for (let round = 0; round < PAGES_PER_TICK; round++) {
-        if (m.cancel) { await this.finish(m, "cancelled", `cancelled after ${m.count} records`); return; }
-        const remaining = Math.min(cap, m.total ?? cap) - m.count;
+      const fetched = () => m.params.fetched ?? 0;
+      for (let round = 0; round < ROUNDS_PER_TICK; round++) {
+        if (m.cancel) { await this.finish(m, "cancelled", `cancelled after ${fetched()} records`); return; }
+        const remaining = Math.min(cap, m.total ?? cap) - fetched();
         if (remaining <= 0) break;
-        const lanes = Math.min(6, Math.ceil(remaining / PAGE_MAX));
-        const offsets = Array.from({ length: lanes }, (_, i) => m.count + i * PAGE_MAX);
+        const lanes = Math.min(6, Math.ceil(remaining / pageSize));
+        const offsets = Array.from({ length: lanes }, (_, i) => fetched() + i * pageSize);
         const pages = await pooled(offsets.map((off) => () => ins.request("GET", `/${o}`, {
-          params: { top: PAGE_MAX, skip: off, brief: String(brief),
+          params: { top: pageSize, skip: off, brief: String(brief),
                     ...(updatedAfterUtc ? { updated_after_utc: updatedAfterUtc } : {}) } })));
         let short = false;
         for (const page of pages) {
           if (page && !Array.isArray(page) && page.error) {
             m.error = page.error;
-            await this.finish(m, "failed", `API error after ${m.count} records`);
+            await this.finish(m, "failed", `API error after ${fetched()} records`);
             return;
           }
-          const rows = brief ? briefStrip(Array.isArray(page) ? page : []) : (Array.isArray(page) ? page : []);
-          if (rows.length) {
-            await this.state.storage.put(`chunk:${m.task_id}:${m.chunks}`, rows.slice(0, CHUNK));
-            m.chunks++; m.count += rows.length; m.progress = m.count;
+          let rows = Array.isArray(page) ? page : [];
+          m.params.fetched = fetched() + rows.length;
+          if (m.kind === "aggregate") {
+            const { groupBy, metrics, where } = m.params;
+            for (const rec of rows) {
+              if (matches(rec, where)) {
+                m.params.matched = (m.params.matched ?? 0) + 1;
+                accumulate(m.params.groups, rec, groupBy, metrics);
+              }
+            }
+          } else {
+            if (brief) rows = briefStrip(rows);
+            if (m.params.fields?.length) rows = projectAll(rows, m.params.fields, o);
+            if (rows.length) await this.appendRows(m, rows);
           }
-          if (rows.length < PAGE_MAX) short = true;
+          if (rows.length < pageSize) short = true;
         }
-        m.status_message = `exported ${m.count}${m.total ? ` of ${m.total}` : ""}`;
+        m.progress = fetched();
+        m.status_message = `${m.kind === "aggregate" ? "scanned" : "exported"} ` +
+          `${fetched()}${m.total ? ` of ${m.total}` : ""}`;
         await this.putMeta(m);
-        if (short || m.count >= cap) {
-          m.summary = { object: o, exported: m.count, truncated: m.count >= cap };
-          await this.finish(m, "completed", `exported ${m.count} records`);
+        if (short || fetched() >= cap) {
+          if (m.kind === "aggregate") {
+            const { groupBy, metrics } = m.params;
+            const rows = finishGroups(m.params.groups, groupBy, metrics);
+            await this.appendRows(m, rows);
+            m.summary = { object: o, scanned: fetched(), matched: m.params.matched ?? 0,
+                          groups: rows.length, group_by: groupBy ?? null };
+            delete m.params.groups;
+            await this.finish(m, "completed", `aggregated ${fetched()} records into ${rows.length} groups`);
+          } else {
+            m.summary = { object: o, exported: fetched(), truncated: fetched() >= cap };
+            await this.finish(m, "completed", `exported ${fetched()} records`);
+          }
           return;
         }
       }
@@ -225,12 +379,11 @@ export class TaskDO {
       const done: number = m.params.done ?? 0;
       const total = m.total ?? 0;
       const batchEnd = Math.min(done + CREATES_PER_TICK, total);
-      const chunkIdx = Math.floor(done / CHUNK);
+      const chunkIdx = Math.floor(done / PAGE_MAX);
       const chunk = await this.state.storage.get<any[]>(`bulkin:${m.task_id}:${chunkIdx}`) ?? [];
-      const slice = chunk.slice(done - chunkIdx * CHUNK, batchEnd - chunkIdx * CHUNK);
+      const slice = chunk.slice(done - chunkIdx * PAGE_MAX, batchEnd - chunkIdx * PAGE_MAX);
       const ids: any[] = m.params.ids ?? [];
       const errors: any[] = m.params.errors ?? [];
-      // Writes go 4-wide: quick, but leaves headroom under the write endpoints' pacing.
       const results = await pooled(slice.map((fields, j) => async () => {
         if (m.cancel || !fields || typeof fields !== "object") {
           return { index: done + j, error: fields ? "cancelled" : "not a field dict" };
@@ -248,8 +401,7 @@ export class TaskDO {
       m.status_message = `created ${ids.length} of ${total}`;
       if (m.cancel) { await this.finish(m, "cancelled", `cancelled after ${ids.length} created`); return; }
       if (batchEnd >= total) {
-        await this.state.storage.put(`chunk:${m.task_id}:0`, ids.slice(0, CHUNK));
-        m.chunks = 1; m.count = ids.length;
+        await this.appendRows(m, ids);
         m.summary = { object: o, created: ids.length, failed: errors.length, errors: errors.slice(0, 20) };
         await this.finish(m, "completed", `created ${ids.length}, ${errors.length} failed`);
         return;

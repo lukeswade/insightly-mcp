@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "insightly-se-mcp-bridge-test",
   "display_name": "Insightly SE MCP \u2014 Bridge (TEST)",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "TESTING \u2014 full Insightly SE MCP served from Cloudflare Workers through a local bridge. Keys stay on this machine.",
   "long_description": "Experimental: the complete Insightly SE MCP (all 35 tools + the interactive dashboard) runs on a Cloudflare Worker; this tiny local bridge forwards each request and attaches your active environment's API key per request. Keys live ONLY in this machine's keystore (~/.insightly-mcp/keys.json \u2014 shared with the classic extension) and are never stored server-side. Environment switching/add/rename/remove run locally in the bridge. Installs ALONGSIDE the classic extension; disable one while testing the other (they expose the same tool names).",
   "author": {

@@ -16,8 +16,9 @@ import {
   newestRecords, obj, pageEnvelope, pooled, project, projectAll, recordContains, sortNewest,
 } from "./insightly";
 import { WIDGET_HTML } from "./widget";
+import { Metric, WhereClause, accumulate, containsAnywhere, finishGroups, matches, referencedFields } from "./query";
 
-export const SERVER_VERSION = "4.1.0-cf";
+export const SERVER_VERSION = "4.2.0-cf";
 const UI_URI = "ui://insightly/env-dashboard.html";
 const SUMMARY_OBJECTS = ["Contacts", "Organisations", "Leads", "Opportunities", "Projects",
   "Tasks", "Events", "Notes", "Emails", "Ticket", "Product", "KnowledgeArticle", "Users"];
@@ -98,9 +99,10 @@ async function snapshot(ins: Insightly, s: WorkerSession): Promise<Record<string
 export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
     (env: any, sess: { key: string; pod: string }, payload: Record<string, unknown>) => Promise<any>): McpServer {
   const server = new McpServer({ name: "insightly-se-mcp", version: SERVER_VERSION }, {
-    // 2026-era cache hints: the tool list is identical for every caller (public, 1h);
+    // 2026-era cache hints: 5 minutes, not an hour — this server iterates fast, and a
+    // long hint is exactly how clients end up reasoning against last week's tool list.
     // field metadata differs per env key, so the resource template hints private below.
-    cacheHints: { "tools/list": { ttlMs: 3_600_000, cacheScope: "public" } },
+    cacheHints: { "tools/list": { ttlMs: 300_000, cacheScope: "public" } },
   } as any);
   const ins = new Insightly({ key: s.key, pod: s.pod });
   const ensure = () => (s.key ? null : NOT_CONNECTED);
@@ -664,6 +666,207 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
     const e = ensure(); if (e) return T(e);
     return T(await ins.request(a.method, "/" + String(a.path).replace(/^\/+/, ""),
                                { params: a.query, body: a.body }));
+  });
+
+
+  // ------------------------------------------------------- query engine + deliverables
+  const whereSchema = z.array(z.object({
+    field: z.string().optional(), contains: z.string().optional(),
+    equals: z.union([z.string(), z.number(), z.boolean()]).optional(),
+    not_empty: z.boolean().optional(),
+    gte: z.union([z.string(), z.number()]).optional(),
+    lte: z.union([z.string(), z.number()]).optional(),
+  })).optional();
+  const metricsSchema = z.array(z.object({
+    op: z.enum(["count", "sum", "avg", "min", "max"]), field: z.string().optional(),
+  })).optional();
+  const WHERE_DOC = "`where`: AND-ed conditions [{field?, contains?|equals?|not_empty?|gte?|lte?}] — " +
+    "contains without field searches every field incl. custom; gte/lte compare numerically " +
+    "when possible, else lexicographically (ISO dates work).";
+
+  server.registerTool("aggregate", {
+    description: "Group-by / sum / count / avg / min / max over an object — the aggregation " +
+      "Insightly's API doesn't have. \"Total opportunity value by pipeline stage\" is one call " +
+      "returning a small table instead of an export plus math in the conversation.\n" +
+      "Small objects compute inline; big ones automatically become a background task (poll " +
+      "task_status, read the grouped table with task_result). Fields (group_by, metric fields, " +
+      "where fields) resolve against standard AND custom fields, flattened. " + WHERE_DOC,
+    inputSchema: z.object({
+      object: z.string(), group_by: z.string().optional(), metrics: metricsSchema,
+      where: whereSchema, updated_after_utc: z.string().optional(),
+      max_inline: z.number().int().optional(), max_records: z.number().int().optional(),
+    }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const o = obj(a.object);
+    const metrics: Metric[] = a.metrics?.length ? a.metrics : [{ op: "count" }];
+    const where: WhereClause[] | undefined = a.where?.length ? a.where : undefined;
+    const inlineCap = Math.min(Math.max(a.max_inline ?? 1000, 100), 2000);
+    const [, hdrs] = await ins.request("GET", `/${o}`, {
+      params: { top: 1, brief: "true", count_total: "true" }, wantHeaders: true });
+    const total = parseInt(hdrs?.["x-total-count"] ?? "", 10);
+    const needFull = referencedFields(a.group_by, metrics, where) === null
+      || (referencedFields(a.group_by, metrics, where) ?? []).length > 0;
+    if (!Number.isNaN(total) && total <= inlineCap) {
+      const res = await fetchAll(ins, o, { brief: !needFull, maxRecords: inlineCap,
+                                           updatedAfterUtc: a.updated_after_utc });
+      if (res.error) return T(res);
+      const state: Record<string, any> = {};
+      let matched = 0;
+      for (const rec of res.items as any[]) {
+        if (!matches(rec, where)) continue;
+        matched++;
+        accumulate(state, rec, a.group_by, metrics);
+      }
+      const rows = finishGroups(state, a.group_by, metrics);
+      return T(fit(rows, { basis: "inline", scanned: res.total_fetched, matched,
+                           groups: rows.length, group_by: a.group_by ?? null }));
+    }
+    const r = await taskCall(env, sess(), { op: "start_aggregate",
+      detail: `${o}${a.group_by ? ` by ${a.group_by}` : ""}`,
+      params: { o, brief: false, updatedAfterUtc: a.updated_after_utc ?? null,
+                cap: Math.min(Math.max(a.max_records ?? 250_000, 1), 250_000),
+                groupBy: a.group_by, metrics, where } });
+    if (r.error) return T(r);
+    return T({ task_id: r.task_id, status: r.status, total_to_scan: Number.isNaN(total) ? null : total,
+      poll_interval_ms: 500,
+      next: `big object — aggregating in the background at the API's rate ceiling. ` +
+            `task_status('${r.task_id}') until completed, then task_result('${r.task_id}') ` +
+            `returns the grouped table.` });
+  });
+
+  server.registerTool("task_query", {
+    description: "Query a COMPLETED export like a table — the API can't sort/filter/aggregate, " +
+      "but the export snapshot can. Sort by ANY field (order_by), filter (where), group and " +
+      "aggregate (group_by/metrics), project (fields) — all server-side over the task's stored " +
+      "records; only the answer reaches the conversation. Pattern for big orgs: start_export " +
+      "once, then ask this snapshot as many questions as you like. " + WHERE_DOC,
+    inputSchema: z.object({
+      task_id: z.string(), where: whereSchema, order_by: z.string().optional(),
+      group_by: z.string().optional(), metrics: metricsSchema,
+      fields: z.array(z.string()).optional(), top: z.number().int().optional(),
+    }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    return T(await taskCall(env, sess(), { op: "query", task_id: a.task_id, where: a.where,
+      order_by: a.order_by, group_by: a.group_by, metrics: a.metrics, fields: a.fields,
+      top: a.top }));
+  });
+
+  server.registerTool("export_csv", {
+    description: "Turn a completed export task into a downloadable CSV file and return the " +
+      "link — the deliverable escapes the chat's size ceiling entirely. Columns are the union " +
+      "of standard fields plus flattened custom fields. The link is unguessable and the file " +
+      "auto-deletes after ~7 days. CAUTION: anyone with the link can download it — treat links " +
+      "from real-data environments accordingly.",
+    inputSchema: z.object({ task_id: z.string() }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const r = await taskCall(env, sess(), { op: "csv", task_id: a.task_id });
+    if (r.error) return T(r);
+    const base = (env?.EXPORTS_PUBLIC_BASE ?? "").replace(/\/$/, "");
+    return T({ url: `${base}/${r.key}`, rows: r.rows, columns: r.columns, bytes: r.bytes,
+               expires: "~7 days (bucket lifecycle)",
+               note: "unguessable link, but public to anyone who has it." });
+  });
+
+  server.registerTool("search_everywhere", {
+    description: "One sweep across the WHOLE environment — every core object plus custom " +
+      "objects — for a term, case-insensitive, standard and custom fields alike. Returns hits " +
+      "grouped by object with compact projected rows. Scans the NEWEST max_scan_per_object " +
+      "records of each object (default 300), so on big orgs say so if the term may be old.",
+    inputSchema: z.object({
+      term: z.string(), objects: z.array(z.string()).optional(),
+      max_scan_per_object: z.number().int().optional(),
+      fields: z.array(z.string()).optional(),
+    }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const needle = String(a.term ?? "").toLowerCase();
+    if (!needle) return T({ error: "term is required." });
+    const cap = Math.min(Math.max(a.max_scan_per_object ?? 300, 50), 1000);
+    let objects: string[];
+    if (a.objects?.length) objects = a.objects.map(obj);
+    else {
+      const defs = await ins.request("GET", "/CustomObjects", { params: { top: 200 } });
+      const custom = (Array.isArray(defs) ? defs : []).map((d: any) => d?.OBJECT_NAME).filter(Boolean);
+      objects = [...SUMMARY_OBJECTS.filter((o) => o !== "Users"), ...custom];
+    }
+    const scanned: Record<string, number> = {};
+    const hits: Record<string, any[]> = {};
+    const errors: Record<string, string> = {};
+    const results = await pooled(objects.map((o) => async () => {
+      const res = await fetchAll(ins, o, { brief: false, maxRecords: cap, newestFirst: true });
+      return { o, res };
+    }), 4);
+    for (const { o, res } of results) {
+      if (res.error && !(res.items as any[])?.length) { errors[o] = res.error; continue; }
+      scanned[o] = res.total_fetched;
+      const found = (res.items as any[]).filter((r) => containsAnywhere(r, needle)).slice(0, 20);
+      if (found.length) {
+        const defaults = [...NAME_FIELDS, "FIRST_NAME", "LAST_NAME", "EMAIL_ADDRESS", "DATE_UPDATED_UTC"];
+        hits[o] = projectAll(found, a.fields?.length ? a.fields : defaults, o);
+      }
+    }
+    const out: Record<string, any> = { term: a.term, objects_scanned: Object.keys(scanned).length,
+      total_hits: Object.values(hits).reduce((n, v) => n + v.length, 0), hits, scanned,
+      note: `each object scanned its NEWEST ${cap} records — raise max_scan_per_object or ` +
+            "search a specific object with filter_records for deeper coverage." };
+    if (Object.keys(errors).length) out.not_searchable = errors;
+    return T(out);
+  });
+
+  server.registerTool("join_related", {
+    description: "Records + fields from their LINKED records, merged into one table in one " +
+      "call — the join Insightly can't do. Example: the 50 newest-closed Opportunities with " +
+      "each linked Organisation's account-ARR field: join_related('Opportunities', " +
+      "relation_field='ORGANISATION_ID', related_object='Organisations', " +
+      "related_fields=['Total_Account_ARR_USD__c'], date_field='ACTUAL_CLOSE_DATE', top=50). " +
+      "Left rows come from `ids` if given, else the newest records (by date_field when set).",
+    inputSchema: z.object({
+      object: z.string(), relation_field: z.string(), related_object: z.string(),
+      related_fields: z.array(z.string()), fields: z.array(z.string()).optional(),
+      ids: z.array(z.number().int()).optional(), date_field: z.string().optional(),
+      top: z.number().int().optional(),
+    }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const o = obj(a.object);
+    const ro = obj(a.related_object);
+    const top = Math.min(Math.max(a.top ?? 25, 1), HYDRATE_MAX);
+    let left: any[];
+    if (a.ids?.length) {
+      left = (await pooled(a.ids.slice(0, HYDRATE_MAX).map((rid: number) => () =>
+        ins.request("GET", `/${o}/${rid}`)))).filter((r: any) => r && !r.error);
+    } else if (a.date_field) {
+      const res = await newestByField(ins, o, String(a.date_field).toUpperCase(), top);
+      if (res.error) return T(res);
+      left = res.items ?? [];
+    } else {
+      const [items] = await newestRecords(ins, o, top);
+      if (items && !Array.isArray(items)) return T(items);
+      const [full] = await hydrate(ins, o, items as any[]);
+      left = full;
+    }
+    const leftFields = a.fields?.length ? a.fields : NAME_FIELDS;
+    const relIds = [...new Set(left.map((r) => r?.[a.relation_field]).filter((v) => v != null))]
+      .slice(0, HYDRATE_MAX);
+    const relRecs = await pooled(relIds.map((rid) => () => ins.request("GET", `/${ro}/${rid}`)));
+    const relById: Record<string, any> = {};
+    relIds.forEach((rid, i) => {
+      const rec = relRecs[i];
+      if (rec && typeof rec === "object" && !rec.error) {
+        relById[String(rid)] = project(rec, a.related_fields, PK[ro] ?? null);
+      }
+    });
+    const rows = left.map((r) => ({
+      ...project(r, [...leftFields, a.relation_field], PK[o] ?? null),
+      related: relById[String(r?.[a.relation_field])] ?? null,
+    }));
+    const missing = relIds.filter((rid) => !(String(rid) in relById));
+    return T(fit(rows, { joined: rows.filter((r) => r.related).length,
+      returned: rows.length, relation: `${o}.${a.relation_field} -> ${ro}`,
+      ...(missing.length ? { missing_related: missing } : {}) }));
   });
 
   // Environment-key tools: executed by the bridge on the user's machine. Advertised here

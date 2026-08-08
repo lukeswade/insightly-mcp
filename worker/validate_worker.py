@@ -128,7 +128,7 @@ def part1_caching() -> None:
     check("resource is advertised", any("insightly://" in str(u) for u in turis), f"templates={turis}")
 
     tl = (s.rpc("tools/list") or {}).get("result", {})
-    check("tools/list carries a cache hint", tl.get("ttlMs") == 3_600_000,
+    check("tools/list carries a cache hint", tl.get("ttlMs") == 300_000,
           f"ttlMs={tl.get('ttlMs')} scope={tl.get('cacheScope')}")
 
     rres = (s.rpc("resources/read", {"uri": "insightly://Contacts/fields"}) or {}).get("result", {})
@@ -552,6 +552,82 @@ def part8_projection() -> None:
     s.close()
 
 
+def part9_query_engine() -> None:
+    """The CF-only capability layer: aggregation, snapshot queries, CSV deliverables,
+    whole-environment search, and joins."""
+    print("\n9. query engine + deliverables (worker-only)")
+    s = Server(capabilities={})
+
+    agg = s.call("aggregate", {"object": "Opportunities", "group_by": "OPPORTUNITY_STATE",
+                               "metrics": [{"op": "count"}, {"op": "sum", "field": "OPPORTUNITY_VALUE"}]})
+    rows = agg.get("items", [])
+    check("aggregate groups + sums inline on a small object",
+          agg.get("basis") == "inline" and rows and "count" in rows[0]
+          and "sum_OPPORTUNITY_VALUE" in rows[0],
+          f"groups={agg.get('groups')} first={str(rows[0])[:80] if rows else None}")
+    total = sum(r.get("count", 0) for r in rows)
+    check("aggregate counts every scanned record", total == agg.get("matched"),
+          f"sum(count)={total} matched={agg.get('matched')}")
+
+    ex = s.call("start_export", {"object": "Tasks", "brief": True})
+    tid = ex.get("task_id")
+    final = None
+    for _ in range(60):
+        st = s.call("task_status", {"task_id": tid})
+        if st.get("status") != "working":
+            final = st
+            break
+        time.sleep(0.5)
+    check("export completes for the query tests", (final or {}).get("status") == "completed")
+
+    q1 = s.call("task_query", {"task_id": tid, "where": [{"contains": "budget"}],
+                               "fields": ["TITLE"], "top": 10})
+    check("task_query filters a snapshot by contains",
+          q1.get("matched", 0) >= 1 and all("TITLE" in r for r in q1.get("items", [])),
+          f"matched={q1.get('matched')} sample={str(q1.get('items', [])[:1])[:60]}")
+    q2 = s.call("task_query", {"task_id": tid, "order_by": "DATE_CREATED_UTC desc",
+                               "fields": ["DATE_CREATED_UTC"], "top": 5})
+    vals = [r.get("DATE_CREATED_UTC") for r in q2.get("items", [])]
+    check("task_query sorts the snapshot by any field",
+          len(vals) == 5 and vals == sorted(vals, reverse=True), f"{vals[:3]}")
+    q3 = s.call("task_query", {"task_id": tid, "group_by": "COMPLETED",
+                               "metrics": [{"op": "count"}]})
+    check("task_query aggregates over the snapshot",
+          q3.get("scanned") == (final or {}).get("result_count")
+          and sum(r.get("count", 0) for r in q3.get("items", [])) == q3.get("scanned"),
+          f"groups={q3.get('groups')} scanned={q3.get('scanned')}")
+
+    csv = s.call("export_csv", {"task_id": tid})
+    check("export_csv returns a download link with real dimensions",
+          str(csv.get("url", "")).startswith("https://") and csv.get("rows", 0) > 300
+          and csv.get("columns", 0) > 10,
+          f"rows={csv.get('rows')} cols={csv.get('columns')} bytes={csv.get('bytes')}")
+    import urllib.request as _u
+    try:
+        req = _u.Request(csv["url"], headers={"User-Agent": "Mozilla/5.0 (suite check)"})
+        head = _u.urlopen(req, timeout=30).read(200).decode(errors="replace")
+        ok_dl = "," in head.splitlines()[0]
+    except Exception as ex2:
+        head, ok_dl = str(ex2), False
+    check("the CSV link actually downloads (header row present)", ok_dl, head[:60])
+
+    sw = s.call("search_everywhere", {"term": "budget", "max_scan_per_object": 200})
+    check("search_everywhere sweeps objects and finds the known task",
+          sw.get("total_hits", 0) >= 1 and any("Tasks" in k for k in sw.get("hits", {})),
+          f"hits={sw.get('total_hits')} objects={sw.get('objects_scanned')}")
+
+    jr = s.call("join_related", {"object": "Opportunities", "relation_field": "ORGANISATION_ID",
+                                 "related_object": "Organisations",
+                                 "related_fields": ["ORGANISATION_NAME"],
+                                 "fields": ["OPPORTUNITY_NAME"], "top": 10})
+    rows = jr.get("items", [])
+    check("join_related merges linked-record fields in one call",
+          jr.get("joined", 0) >= 1 and rows
+          and any((r.get("related") or {}).get("ORGANISATION_NAME") for r in rows),
+          f"joined={jr.get('joined')} of {jr.get('returned')}")
+    s.close()
+
+
 def part5_audit() -> None:
     print("\n5. swagger/API-doc audit fixes")
     s = Server(capabilities={})
@@ -629,6 +705,7 @@ def main() -> int:
     part6_newest()
     part7_payload()
     part8_projection()
+    part9_query_engine()
 
     failed = [r for r in results if r[0] == FAIL]
     print(f"\n=== {len(results) - len(failed)}/{len(results)} checks passed ===")

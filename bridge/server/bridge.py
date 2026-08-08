@@ -314,8 +314,47 @@ def relay(line: str) -> None:
             return
 
 
+def _tools_hash() -> str:
+    """Hash of the upstream tool surface (names + descriptions + schemas)."""
+    import hashlib
+    r = _client.post(URL, content=json.dumps({
+        "jsonrpc": "2.0", "id": "watch", "method": "tools/list", "params": {}}),
+        headers=_headers("tools/list"))
+    body = _parse_single(r) or {}
+    tools = (body.get("result") or {}).get("tools") or []
+    canon = json.dumps([[t.get("name"), t.get("description"), t.get("inputSchema")]
+                        for t in tools], sort_keys=True)
+    return hashlib.sha256(canon.encode()).hexdigest()
+
+
+def schema_watchdog() -> None:
+    """The server deploys independently of this long-lived process, but the host only
+    re-reads tools/list when told to. Watch the upstream surface and announce changes,
+    so a worker deploy reaches running sessions within minutes instead of at the next
+    extension restart."""
+    import time
+    baseline = None
+    delay = 20                       # first check soon after launch, then every 5 minutes
+    while True:
+        time.sleep(delay)
+        delay = 300
+        try:
+            h = _tools_hash()
+        except Exception as e:                                 # noqa: BLE001
+            log(f"schema watchdog: poll failed ({e})")
+            continue
+        if baseline is None:
+            baseline = h
+            continue
+        if h != baseline:
+            baseline = h
+            log("upstream tool surface changed — notifying the host")
+            emit({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+
+
 def main() -> None:
     boot_session()
+    threading.Thread(target=schema_watchdog, daemon=True).start()
     log(f"bridging stdio <-> {URL} (active env: {ACTIVE['name'] or 'none'})")
     for line in sys.stdin:
         line = line.strip()
