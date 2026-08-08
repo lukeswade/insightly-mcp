@@ -489,6 +489,69 @@ def part7_payload() -> None:
     s.close()
 
 
+def part8_projection() -> None:
+    """Server-side field projection: the answer to Insightly having no field selection
+    and no batch-get. Big records are trimmed at the worker, not in the conversation."""
+    print("\n8. field projection (worker-only)")
+    s = Server(capabilities={})
+    desc = s.call("describe_object", {"object": "Contacts"})
+    cf = (desc.get("custom_fields") or [{}])[0].get("name")
+
+    # find a record that actually CARRIES a populated custom field — absent-from-layout
+    # fields are omitted by design (that distinction is the point), so the check must not
+    # conflate "record has no custom values" with "flattening is broken"
+    batch = s.call("list_records", {"object": "Contacts", "top": 60,
+                                    "brief": False}).get("items", [])
+    cid, carried, full = None, None, None
+    for r in batch:
+        entries = [c for c in (r.get("CUSTOMFIELDS") or []) if c.get("FIELD_NAME")]
+        if entries:
+            cid, carried, full = r.get("CONTACT_ID"), entries[0]["FIELD_NAME"], r
+            break
+    if cid is None:
+        cid = batch[0].get("CONTACT_ID") if batch else None
+        full = batch[0] if batch else {}
+        carried = cf
+    proj = s.call("get_record", {"object": "Contacts", "record_id": cid,
+                                 "fields": ["FIRST_NAME", "LAST_NAME", carried]})
+    check("get_record fields returns only pk + requested fields",
+          set(proj) <= {"CONTACT_ID", "FIRST_NAME", "LAST_NAME", carried},
+          f"keys={sorted(proj)}")
+    check("projection is much smaller than the full record",
+          len(json.dumps(proj)) < len(json.dumps(full)) / 3,
+          f"{len(json.dumps(proj))} vs {len(json.dumps(full))} bytes")
+    check("a carried custom field is flattened to plain name: value",
+          carried in proj, f"{carried}={str(proj.get(carried))[:40]}")
+    ghost = s.call("get_record", {"object": "Contacts", "record_id": cid,
+                                  "fields": ["No_Such_Field_Xyz__c"]})
+    check("an absent field is omitted, not invented (absent != null)",
+          "No_Such_Field_Xyz__c" not in ghost, f"keys={sorted(ghost)}")
+
+    lr = s.call("list_records", {"object": "Contacts", "top": 20,
+                                 "fields": ["FIRST_NAME", "EMAIL_ADDRESS"]})
+    rows = lr.get("items", [])
+    check("list_records projects every row",
+          rows and all(set(r) <= {"CONTACT_ID", "FIRST_NAME", "EMAIL_ADDRESS"} for r in rows),
+          f"{len(rows)} rows, keys={sorted(rows[0]) if rows else None}")
+
+    ids = [r["CONTACT_ID"] for r in rows[:5] if r.get("CONTACT_ID")]
+    rl = s.call("resolve_lookups", {"object": "Contacts", "ids": ids,
+                                    "fields": ["EMAIL_ADDRESS", cf]})
+    vals = rl.get("values", {})
+    check("resolve_lookups fields returns a per-id values map",
+          len(vals) == len(ids) and all("EMAIL_ADDRESS" in v for v in vals.values()),
+          f"{len(vals)} ids, sample={str(list(vals.values())[:1])[:80]}")
+    check("names still come back alongside values", len(rl.get("names", {})) == len(ids))
+
+    nb = s.call("newest_by", {"object": "Opportunities", "date_field": "ACTUAL_CLOSE_DATE",
+                              "top": 5, "fields": ["OPPORTUNITY_NAME", "OPPORTUNITY_STATE"]})
+    rows = nb.get("items", [])
+    check("newest_by projects and keeps the ranking field",
+          rows and all("ACTUAL_CLOSE_DATE" in r and "OPPORTUNITY_NAME" in r for r in rows),
+          f"keys={sorted(rows[0]) if rows else None}")
+    s.close()
+
+
 def part5_audit() -> None:
     print("\n5. swagger/API-doc audit fixes")
     s = Server(capabilities={})
@@ -565,6 +628,7 @@ def main() -> int:
     part5_audit()
     part6_newest()
     part7_payload()
+    part8_projection()
 
     failed = [r for r in results if r[0] == FAIL]
     print(f"\n=== {len(results) - len(failed)}/{len(results)} checks passed ===")

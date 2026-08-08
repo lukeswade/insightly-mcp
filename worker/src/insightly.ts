@@ -451,3 +451,43 @@ export async function newestByField(ins: Insightly, o: string, field: string, wa
 export function mask(k?: string | null): string {
   return k && k.length >= 4 ? "…" + k.slice(-4) : (k ? "set" : "");
 }
+
+/**
+ * Server-side field projection — the workaround for two Insightly API gaps at once:
+ * no field selection (every read returns the whole record) and no batch-get. Big
+ * Organisation records run 100KB+ (300+ custom fields, a LINKS array with 100+ entries);
+ * reading one number off 35 of them used to mean 3.5MB into the conversation. Projection
+ * fetches the full record HERE and returns only what was asked for.
+ *
+ * Fields resolve against the record's top-level keys first, then inside the CUSTOMFIELDS
+ * array (v3.1 nests custom values as {FIELD_NAME, FIELD_VALUE}), flattened to plain
+ * `name: value` — case-insensitive on both. The primary key always rides along so results
+ * stay joinable. Missing fields are simply absent, never invented.
+ */
+export function project(rec: any, fields: string[], pk?: string | null): Record<string, any> {
+  if (!rec || typeof rec !== "object") return {};
+  const out: Record<string, any> = {};
+  if (pk && rec[pk] !== undefined) out[pk] = rec[pk];
+  const topByLower: Record<string, string> = {};
+  for (const k of Object.keys(rec)) topByLower[k.toLowerCase()] = k;
+  const cf = Array.isArray(rec.CUSTOMFIELDS) ? rec.CUSTOMFIELDS : [];
+  for (const f of fields) {
+    const want = String(f);
+    const topKey = topByLower[want.toLowerCase()];
+    if (topKey !== undefined && topKey !== "CUSTOMFIELDS") {
+      out[want] = rec[topKey];
+      continue;
+    }
+    const hit = cf.find((c: any) =>
+      String(c?.FIELD_NAME ?? "").toLowerCase() === want.toLowerCase() ||
+      String(c?.CUSTOM_FIELD_ID ?? "").toLowerCase() === want.toLowerCase());
+    if (hit) out[want] = hit.FIELD_VALUE;
+  }
+  return out;
+}
+
+export function projectAll(items: any[], fields: string[] | undefined, o: string): any[] {
+  if (!fields?.length || !Array.isArray(items)) return items;
+  const pk = PK[o] ?? null;
+  return items.map((r) => project(r, fields, pk));
+}

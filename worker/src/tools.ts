@@ -13,11 +13,11 @@ import { z } from "zod";
 import {
   COMMON_OBJECTS, HYDRATE_MAX, Insightly, LINKABLE, NAME_FIELDS, PAGE_MAX, PK, SCAN_CAP,
   applySort, briefStrip, fetchAll, fit, forwardDated, hydrate, mask, newestByField,
-  newestRecords, obj, pageEnvelope, pooled, recordContains, sortNewest,
+  newestRecords, obj, pageEnvelope, pooled, project, projectAll, recordContains, sortNewest,
 } from "./insightly";
 import { WIDGET_HTML } from "./widget";
 
-export const SERVER_VERSION = "4.0.0-cf";
+export const SERVER_VERSION = "4.1.0-cf";
 const UI_URI = "ui://insightly/env-dashboard.html";
 const SUMMARY_OBJECTS = ["Contacts", "Organisations", "Leads", "Opportunities", "Projects",
   "Tasks", "Events", "Notes", "Emails", "Ticket", "Product", "KnowledgeArticle", "Users"];
@@ -180,27 +180,34 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
       "- updated_after_utc: NOTE the list endpoint ignores this filter; search_records applies it for real.\n" +
       "- order_by like 'DATE_UPDATED_UTC desc' sorts the RETURNED records CLIENT-SIDE.\n" +
       "For the newest records use newest_records — records come back in ascending id order, " +
-      "so page 1 is the OLDEST. For finding records prefer search_records / filter_records.",
+      "so page 1 is the OLDEST. For finding records prefer search_records / filter_records." +
+      "\n`fields`: optional list of field names to return INSTEAD of whole records \u2014 matched top-level or inside CUSTOMFIELDS (flattened), pk always included. Use it whenever you are building a table: big records (Organisations carry 300+ custom fields and a LINKS array) are 100KB+ each, and projection trims them server-side before they ever reach the conversation. A field present with an empty value returns null; a field ABSENT from that record's layout is omitted entirely — Insightly layouts differ per pipeline/record type, and that distinction is often the answer.",
     inputSchema: z.object({
       object: z.string(), top: z.number().int().optional(), skip: z.number().int().optional(),
       brief: z.boolean().optional(), order_by: z.string().optional(),
       updated_after_utc: z.string().optional(), count_total: z.boolean().optional(),
       fetch_all: z.boolean().optional(), max_records: z.number().int().optional(),
+      fields: z.array(z.string()).optional(),
     }),
   }, async (a: any) => {
     const e = ensure(); if (e) return T(e);
     const o = obj(a.object);
+    const wantFields: string[] | undefined = a.fields?.length ? a.fields : undefined;
+    // Projection needs the full record on the wire (custom fields live in CUSTOMFIELDS,
+    // which brief strips); the trim happens here instead, and is far bigger.
+    const brief = wantFields ? false : (a.brief ?? true);
     if (a.fetch_all) {
-      const res = await fetchAll(ins, o, { brief: a.brief ?? true,
+      const res = await fetchAll(ins, o, { brief,
         updatedAfterUtc: a.updated_after_utc, maxRecords: a.max_records ?? 500 });
       let items = res.items;
       delete res.items;
       if (a.order_by) items = applySort(items, a.order_by);
+      items = projectAll(items, wantFields, o);
       return T(fit(items, res));
     }
     const page = Math.min(Math.max(a.top ?? 100, 1), PAGE_MAX);
     const params: Record<string, unknown> = { top: page, skip: Math.max(a.skip ?? 0, 0),
-      brief: String(a.brief ?? true) };
+      brief: String(brief) };
     if (a.updated_after_utc) params.updated_after_utc = a.updated_after_utc;
     if (a.count_total) params.count_total = "true";
     const [body, hdrs] = await ins.request("GET", `/${o}`, { params, wantHeaders: true });
@@ -211,8 +218,9 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
       return T(body);
     }
     let items = Array.isArray(body) ? body : [];
-    if (a.brief ?? true) briefStrip(items);
+    if (brief) briefStrip(items);
     if (a.order_by) items = applySort(items, a.order_by);
+    items = projectAll(items, wantFields, o);
     const envl = pageEnvelope(items, Math.max(a.skip ?? 0, 0), page);
     if (a.count_total) {
       const t = parseInt(hdrs?.["x-total-count"] ?? "", 10);
@@ -228,8 +236,10 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
       "them: the API returns records in ascending id order and has no sort parameter, so its " +
       "first page is the OLDEST records. This walks /{Object}/Search — which does honour a " +
       "date filter — or reads the whole object when it is small enough, then ranks by the " +
-      "later of DATE_CREATED_UTC and DATE_UPDATED_UTC. The `basis` field says which.",
-    inputSchema: z.object({ object: z.string(), top: z.number().int().optional() }),
+      "later of DATE_CREATED_UTC and DATE_UPDATED_UTC. The `basis` field says which." +
+      "\n`fields`: optional list of field names to return INSTEAD of whole records \u2014 matched top-level or inside CUSTOMFIELDS (flattened), pk always included. Use it whenever you are building a table: big records (Organisations carry 300+ custom fields and a LINKS array) are 100KB+ each, and projection trims them server-side before they ever reach the conversation. A field present with an empty value returns null; a field ABSENT from that record's layout is omitted entirely — Insightly layouts differ per pipeline/record type, and that distinction is often the answer.",
+    inputSchema: z.object({ object: z.string(), top: z.number().int().optional(),
+                            fields: z.array(z.string()).optional() }),
   }, async (a: any) => {
     const e = ensure(); if (e) return T(e);
     const o = obj(a.object);
@@ -237,10 +247,12 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
     const [items, total, basis] = await newestRecords(ins, o, want);
     if (items && !Array.isArray(items) && items.error) return T(items);
     const [full, note] = await hydrate(ins, o, items as any[]);
-    const out: Record<string, any> = { returned: full.length, detail_level: note,
+    const rows = projectAll(full, a.fields?.length ? a.fields : undefined, o);
+    const out: Record<string, any> = { returned: rows.length,
+      detail_level: a.fields?.length ? `projected to ${a.fields.length} fields` : note,
       sorted_by: "most recently created or updated, newest first", basis };
     if (total !== null) out.total = total;
-    return T(fit(full, out));
+    return T(fit(rows, out));
   });
 
   server.registerTool("newest_by", {
@@ -250,9 +262,11 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
       "a change window with one-record count probes, fetches only that window, ranks inside it, " +
       "and reports the cost. `complete: true` means the answer is provably the true top N.\n" +
       "Only works for fields that cannot postdate a record's last update. Forecast/due/renewal " +
-      "dates are rejected — export instead. Returned records are hydrated to full detail.",
+      "dates are rejected — export instead. Returned records are hydrated to full detail." +
+      "\n`fields`: optional list of field names to return INSTEAD of whole records \u2014 matched top-level or inside CUSTOMFIELDS (flattened), pk always included. Use it whenever you are building a table: big records (Organisations carry 300+ custom fields and a LINKS array) are 100KB+ each, and projection trims them server-side before they ever reach the conversation. A field present with an empty value returns null; a field ABSENT from that record's layout is omitted entirely — Insightly layouts differ per pipeline/record type, and that distinction is often the answer.",
     inputSchema: z.object({ object: z.string(), date_field: z.string(),
-                            top: z.number().int().optional() }),
+                            top: z.number().int().optional(),
+                            fields: z.array(z.string()).optional() }),
   }, async (a: any) => {
     const e = ensure(); if (e) return T(e);
     const field = String(a.date_field ?? "").trim().toUpperCase();
@@ -263,33 +277,42 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
         hint: "Rank on a field that is written when the event happens (ACTUAL_CLOSE_DATE, " +
           "DATE_CREATED_UTC), or run start_export and rank the exported records." });
     }
-    return T(await newestByField(ins, obj(a.object), field,
-                                 Math.min(Math.max(a.top ?? 50, 1), HYDRATE_MAX)));
+    const res = await newestByField(ins, obj(a.object), field,
+                                    Math.min(Math.max(a.top ?? 50, 1), HYDRATE_MAX));
+    if (a.fields?.length && Array.isArray(res.items)) {
+      res.items = projectAll(res.items, [field, ...a.fields], obj(a.object));
+      res.detail_level = `projected to ${a.fields.length + 1} fields`;
+    }
+    return T(res);
   });
 
   server.registerTool("search_records", {
     description: "EXACT-match search on a single field (the API does not do partial match here), " +
       "e.g. search_records('Contacts', 'EMAIL_ADDRESS', 'jane@example.com'). Works on standard " +
       "AND custom fields (use the custom FIELD_NAME, e.g. 'Intake_Status__c'). For substring " +
-      "matching use filter_records. Supports count_total and updated_after_utc.",
+      "matching use filter_records. Supports count_total and updated_after_utc." +
+      "\n`fields`: optional list of field names to return INSTEAD of whole records \u2014 matched top-level or inside CUSTOMFIELDS (flattened), pk always included. Use it whenever you are building a table: big records (Organisations carry 300+ custom fields and a LINKS array) are 100KB+ each, and projection trims them server-side before they ever reach the conversation. A field present with an empty value returns null; a field ABSENT from that record's layout is omitted entirely — Insightly layouts differ per pipeline/record type, and that distinction is often the answer.",
     inputSchema: z.object({
       object: z.string(), field_name: z.string(), field_value: z.string(),
       top: z.number().int().optional(), skip: z.number().int().optional(),
       count_total: z.boolean().optional(), updated_after_utc: z.string().optional(),
-      brief: z.boolean().optional(),
+      brief: z.boolean().optional(), fields: z.array(z.string()).optional(),
     }),
   }, async (a: any) => {
     const e = ensure(); if (e) return T(e);
     const page = Math.min(Math.max(a.top ?? 20, 1), PAGE_MAX);
+    const wantFields: string[] | undefined = a.fields?.length ? a.fields : undefined;
+    const brief = wantFields ? false : (a.brief ?? true);
     const params: Record<string, unknown> = { field_name: a.field_name, field_value: a.field_value,
-      top: page, skip: Math.max(a.skip ?? 0, 0), brief: String(a.brief ?? true) };
+      top: page, skip: Math.max(a.skip ?? 0, 0), brief: String(brief) };
     if (a.updated_after_utc) params.updated_after_utc = a.updated_after_utc;
     if (a.count_total) params.count_total = "true";
     const [body, hdrs] = await ins.request("GET", `/${obj(a.object)}/Search`,
                                            { params, wantHeaders: true });
     if (body && !Array.isArray(body) && body.error) return T(body);
-    const items = Array.isArray(body) ? body : [];
-    if (a.brief ?? true) briefStrip(items);
+    let items = Array.isArray(body) ? body : [];
+    if (brief) briefStrip(items);
+    items = projectAll(items, wantFields, obj(a.object));
     const envl = pageEnvelope(items, Math.max(a.skip ?? 0, 0), page);
     if (a.count_total) {
       const t = parseInt(hdrs?.["x-total-count"] ?? "", 10);
@@ -317,10 +340,12 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
       "matching `contains` (case-insensitive) — in `field_name` if given, otherwise in ANY " +
       "top-level field. If the object holds more than max_scan records the scan covers the " +
       "NEWEST max_scan of them. brief defaults FALSE here on purpose: brief strips DETAILS and " +
-      "CUSTOMFIELDS, exactly where a stray mention tends to hide.",
+      "CUSTOMFIELDS, exactly where a stray mention tends to hide." +
+      "\n`fields`: optional list of field names to return INSTEAD of whole records \u2014 matched top-level or inside CUSTOMFIELDS (flattened), pk always included. Use it whenever you are building a table: big records (Organisations carry 300+ custom fields and a LINKS array) are 100KB+ each, and projection trims them server-side before they ever reach the conversation. A field present with an empty value returns null; a field ABSENT from that record's layout is omitted entirely — Insightly layouts differ per pipeline/record type, and that distinction is often the answer.",
     inputSchema: z.object({
       object: z.string(), contains: z.string(), field_name: z.string().optional(),
       brief: z.boolean().optional(), max_scan: z.number().int().optional(),
+      fields: z.array(z.string()).optional(),
     }),
   }, async (a: any) => {
     const e = ensure(); if (e) return T(e);
@@ -328,7 +353,9 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
       maxRecords: a.max_scan ?? 1000, newestFirst: true });
     if (res.error && !(res.items as any[])?.length) return T(res);
     const needle = String(a.contains ?? "").toLowerCase();
-    const hits = sortNewest((res.items as any[]).filter((r) => recordContains(r, needle, a.field_name)));
+    const hits = projectAll(
+      sortNewest((res.items as any[]).filter((r) => recordContains(r, needle, a.field_name))),
+      a.fields?.length ? a.fields : undefined, obj(a.object));
     return T(fit(hits, { matched: hits.length, scanned: res.total_fetched,
       scanned_from: "newest",
       searched_fields: (a.brief ?? false)
@@ -337,24 +364,36 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
   });
 
   server.registerTool("get_record", {
-    description: "Fetch one record by id, e.g. get_record('Contacts', 12345). Shows field names.",
-    inputSchema: z.object({ object: z.string(), record_id: z.number().int() }),
+    description: "Fetch one record by id, e.g. get_record('Contacts', 12345). Shows field names." +
+      "\n`fields`: optional list of field names to return INSTEAD of whole records \u2014 matched top-level or inside CUSTOMFIELDS (flattened), pk always included. Use it whenever you are building a table: big records (Organisations carry 300+ custom fields and a LINKS array) are 100KB+ each, and projection trims them server-side before they ever reach the conversation. A field present with an empty value returns null; a field ABSENT from that record's layout is omitted entirely — Insightly layouts differ per pipeline/record type, and that distinction is often the answer.",
+    inputSchema: z.object({ object: z.string(), record_id: z.number().int(),
+                            fields: z.array(z.string()).optional() }),
   }, async (a: any) => {
     const e = ensure(); if (e) return T(e);
-    return T(await ins.request("GET", `/${obj(a.object)}/${a.record_id}`));
+    const o = obj(a.object);
+    const rec = await ins.request("GET", `/${o}/${a.record_id}`);
+    if (a.fields?.length && rec && typeof rec === "object" && !rec.error) {
+      return T(project(rec, a.fields, PK[o] ?? null));
+    }
+    return T(rec);
   });
 
   server.registerTool("resolve_lookups", {
     description: "Turn a list of record ids into {id: name} — for the ORGANISATION_ID / " +
       "CONTACT_ID style lookup fields that come back as bare numbers. One tool call returns " +
-      "just the names instead of dozens of full records. Unknown ids come back under `missing`.",
-    inputSchema: z.object({ object: z.string(), ids: z.array(z.number().int()) }),
+      "just the names instead of dozens of full records. Unknown ids come back under `missing`.\n" +
+      "`fields`: also return those fields per id (top-level or custom, flattened) under " +
+      "`values` — THE way to read one column off many big records, e.g. account ARR off 35 " +
+      "linked Organisations in one call, a few bytes per org instead of 100KB.",
+    inputSchema: z.object({ object: z.string(), ids: z.array(z.number().int()),
+                            fields: z.array(z.string()).optional() }),
   }, async (a: any) => {
     const e = ensure(); if (e) return T(e);
     const o = obj(a.object);
     const wanted = [...new Set((a.ids ?? []).map((i: any) => Math.trunc(i)))].slice(0, HYDRATE_MAX);
     if (!wanted.length) return T({ error: "ids is required (a list of record ids)." });
     const names: Record<string, any> = {};
+    const values: Record<string, any> = {};
     const missing: number[] = [];
     // Parallel: the whole point of this tool is turning N round-trips into one call.
     const recs = await pooled(wanted.map((rid) => () => ins.request("GET", `/${o}/${rid}`)));
@@ -366,9 +405,11 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
         label = ["FIRST_NAME", "LAST_NAME"].map((f) => rec[f]).filter(Boolean).join(" ") || null;
       }
       names[String(rid)] = label;
+      if (a.fields?.length) values[String(rid)] = project(rec, a.fields);
     });
     const out: Record<string, any> = { object: o, pk: PK[o] ?? null, names,
       resolved: Object.keys(names).length, requested: wanted.length };
+    if (a.fields?.length) out.values = values;
     if (missing.length) out.missing = missing;
     if ((a.ids ?? []).length > HYDRATE_MAX) {
       out.note = `Only the first ${HYDRATE_MAX} ids were resolved — each one costs an API ` +
