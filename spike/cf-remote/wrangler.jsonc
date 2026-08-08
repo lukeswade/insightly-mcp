@@ -1,0 +1,7 @@
+{
+  "name": "insightly-mcp-spike",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true }
+}

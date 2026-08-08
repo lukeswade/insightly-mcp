@@ -1,0 +1,84 @@
+{
+  "manifest_version": "0.4",
+  "name": "insightly-se-mcp-bridge-test",
+  "display_name": "Insightly SE MCP — Bridge (TEST)",
+  "version": "0.1.0",
+  "description": "TESTING ONLY — thin bridge to a remote (Cloudflare Workers) MCP server. Synthetic data, no API keys.",
+  "long_description": "Experimental bridge: Claude Desktop runs this tiny local stub, and every tool call is answered by a remote MCP server on Cloudflare Workers. Installs ALONGSIDE the real Insightly SE MCP without touching it. The default server is a public spike serving fake 'spike-demo' data — its only job is to prove the remote architecture (including the interactive dashboard) end to end. No Insightly API key is used or requested.",
+  "author": {
+    "name": "Luke Wade",
+    "url": "https://github.com/lukeswade/insightly-mcp"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lukeswade/insightly-mcp"
+  },
+  "license": "MIT",
+  "keywords": [
+    "insightly",
+    "internal",
+    "bridge",
+    "testing"
+  ],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/bridge.py",
+    "mcp_config": {
+      "command": "${user_config.uv_path}",
+      "args": [
+        "run",
+        "--with",
+        "httpx<1",
+        "python",
+        "${__dirname}/server/bridge.py"
+      ],
+      "env": {
+        "BRIDGE_URL": "${user_config.server_url}"
+      },
+      "platform_overrides": {
+        "win32": {
+          "command": "uv",
+          "args": [
+            "run",
+            "--with",
+            "httpx<1",
+            "python",
+            "${__dirname}${/}server${/}bridge.py"
+          ]
+        }
+      }
+    }
+  },
+  "user_config": {
+    "server_url": {
+      "type": "string",
+      "title": "Remote MCP server URL",
+      "description": "The Streamable-HTTP MCP endpoint this bridge forwards to. Leave the default to test against the public spike (fake data).",
+      "default": "https://insightly-mcp-spike.lukeswade.workers.dev/mcp",
+      "required": false
+    },
+    "uv_path": {
+      "type": "file",
+      "title": "Path to uv",
+      "description": "macOS only — Windows finds uv on PATH automatically. Same value as your existing Insightly SE MCP extension. Apple Silicon + Homebrew default is prefilled; otherwise run `which uv` in Terminal.",
+      "default": "/opt/homebrew/bin/uv",
+      "required": false
+    }
+  },
+  "tools": [
+    {
+      "name": "env_dashboard",
+      "description": "Interactive dashboard (spike build: synthetic data), served from the remote worker."
+    },
+    {
+      "name": "ping",
+      "description": "Liveness check answered by the remote worker."
+    }
+  ],
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "win32"
+    ]
+  }
+}
