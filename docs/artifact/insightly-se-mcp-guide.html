@@ -1,0 +1,482 @@
+<title>Insightly SE MCP — Install &amp; Cheatsheet</title>
+<style>
+  :root {
+    --paper: #FBF9F6;
+    --surface: #F3EFE9;
+    --ink: #211B14;
+    --muted: #6F6357;
+    --line: #E2DBD1;
+    --accent: #D8382E;
+    --accent-deep: #A32A22;
+    --accent-wash: #FBEAE8;
+    --good: #2E7D4F;
+    --good-wash: #E8F2EC;
+    --mono-bg: #211B14;
+    --mono-ink: #F5EFE7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #17130E;
+      --surface: #211C15;
+      --ink: #EDE6DC;
+      --muted: #A79B8D;
+      --line: #383025;
+      --accent: #F2604F;
+      --accent-deep: #F2604F;
+      --accent-wash: #33201C;
+      --good: #63B888;
+      --good-wash: #1D2B22;
+      --mono-bg: #0E0B07;
+      --mono-ink: #EDE6DC;
+    }
+  }
+  :root[data-theme="light"] {
+    --paper: #FBF9F6; --surface: #F3EFE9; --ink: #211B14; --muted: #6F6357;
+    --line: #E2DBD1; --accent: #D8382E; --accent-deep: #A32A22; --accent-wash: #FBEAE8;
+    --good: #2E7D4F; --good-wash: #E8F2EC; --mono-bg: #211B14; --mono-ink: #F5EFE7;
+  }
+  :root[data-theme="dark"] {
+    --paper: #17130E; --surface: #211C15; --ink: #EDE6DC; --muted: #A79B8D;
+    --line: #383025; --accent: #F2604F; --accent-deep: #F2604F; --accent-wash: #33201C;
+    --good: #63B888; --good-wash: #1D2B22; --mono-bg: #0E0B07; --mono-ink: #EDE6DC;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--paper); color: var(--ink);
+    font-family: "Avenir Next", "Seravek", -apple-system, system-ui, sans-serif;
+    font-size: 16px; line-height: 1.55;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 48px 24px 80px; }
+
+  .eyebrow {
+    font-size: 12px; font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--accent-deep); margin: 0 0 10px;
+  }
+  h1 {
+    font-size: clamp(28px, 5vw, 38px); font-weight: 600; line-height: 1.12;
+    letter-spacing: -0.015em; margin: 0 0 12px; text-wrap: balance;
+  }
+  .lede { font-size: 18px; color: var(--muted); margin: 0 0 20px; max-width: 58ch; }
+  .lede strong { color: var(--ink); font-weight: 600; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 36px; }
+  .chip {
+    font-size: 13px; font-weight: 600; padding: 4px 12px; border-radius: 999px;
+    background: var(--surface); border: 1px solid var(--line); color: var(--muted);
+  }
+  .chip.version { background: var(--accent-wash); border-color: transparent; color: var(--accent-deep); }
+
+  .download {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 14px;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
+    padding: 20px; margin: 0 0 48px;
+  }
+  .download .btn {
+    display: inline-block; background: var(--accent); color: #fff; text-decoration: none;
+    font-weight: 600; font-size: 15px; padding: 11px 20px; border-radius: 10px;
+    white-space: nowrap;
+  }
+  .download .btn:hover { background: var(--accent-deep); }
+  .download .btn:focus-visible { outline: 3px solid var(--accent-wash); outline-offset: 2px; }
+  .download small { color: var(--muted); font-size: 13px; line-height: 1.5; flex: 1; min-width: 220px; }
+
+  h2 {
+    font-size: 22px; font-weight: 600; letter-spacing: -0.01em;
+    margin: 52px 0 6px; text-wrap: balance;
+  }
+  .h2-sub { color: var(--muted); font-size: 15px; margin: 0 0 22px; max-width: 60ch; }
+
+  ol.steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 18px; }
+  ol.steps > li {
+    display: grid; grid-template-columns: 34px 1fr; gap: 14px;
+    padding: 18px 18px 18px 14px; background: var(--surface);
+    border: 1px solid var(--line); border-radius: 12px;
+  }
+  .stepnum {
+    width: 30px; height: 30px; border-radius: 999px; background: var(--accent);
+    color: #fff; font-weight: 600; font-size: 15px;
+    display: flex; align-items: center; justify-content: center; margin-top: 1px;
+  }
+  .stepbody h3 { margin: 2px 0 6px; font-size: 16.5px; font-weight: 600; }
+  .stepbody p { margin: 0 0 8px; color: var(--muted); font-size: 15px; }
+  .stepbody p:last-child { margin-bottom: 0; }
+  .stepbody .fine { font-size: 13.5px; }
+
+  pre.cmd {
+    background: var(--mono-bg); color: var(--mono-ink); border-radius: 9px;
+    padding: 12px 14px; margin: 8px 0;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13.5px; line-height: 1.6;
+  }
+  code {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.9em;
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 5px; padding: 1px 5px;
+  }
+  pre.cmd code { background: none; border: none; padding: 0; font-size: inherit; }
+  .stepbody kbd, td kbd {
+    font-family: inherit; font-size: 13px; font-weight: 600;
+    border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 6px;
+    padding: 1px 7px; background: var(--paper);
+  }
+
+  .works {
+    display: flex; gap: 12px; align-items: flex-start;
+    background: var(--good-wash); border-radius: 12px; padding: 16px 18px; margin-top: 18px;
+  }
+  .works .tick { color: var(--good); font-weight: 700; font-size: 18px; line-height: 1.3; }
+  .works p { margin: 0; font-size: 15px; }
+  .works .say { font-style: italic; }
+
+  .group-label {
+    font-size: 12px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--accent-deep); margin: 26px 0 10px;
+  }
+  .prompts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 620px) { .prompts { grid-template-columns: 1fr; } }
+  .prompt {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+    border-top-left-radius: 3px; padding: 13px 15px;
+  }
+  .prompt .say { font-style: italic; font-size: 15px; display: block; }
+  .prompt .why { display: block; margin-top: 7px; font-size: 13px; color: var(--muted); }
+
+  .flow {
+    display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: 10px;
+    align-items: stretch; margin: 20px 0 14px;
+  }
+  @media (max-width: 620px) { .flow { grid-template-columns: 1fr; } .flow .arrow { transform: rotate(90deg); justify-self: center; } }
+  .node {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+    padding: 14px 15px;
+  }
+  .node b { display: block; font-size: 14.5px; margin-bottom: 4px; }
+  .node span { font-size: 13px; color: var(--muted); }
+  .arrow { align-self: center; color: var(--accent); font-weight: 700; font-size: 18px; }
+
+  ul.plain { margin: 14px 0 0; padding: 0 0 0 2px; list-style: none; display: flex; flex-direction: column; gap: 9px; }
+  ul.plain li { padding-left: 22px; position: relative; font-size: 15px; }
+  ul.plain li::before { content: "—"; position: absolute; left: 0; color: var(--accent); font-weight: 600; }
+  ul.plain .muted { color: var(--muted); }
+
+  .tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14.5px; }
+  th, td { text-align: left; padding: 11px 14px; vertical-align: top; }
+  th {
+    font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 600;
+    color: var(--muted); background: var(--surface); border-bottom: 1px solid var(--line);
+  }
+  tr + tr td { border-top: 1px solid var(--line); }
+  td:first-child { font-weight: 600; width: 38%; }
+  td .say { font-style: italic; }
+
+  details.whatsnew {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 14px;
+    padding: 0; margin: -28px 0 48px;
+  }
+  details.whatsnew summary {
+    cursor: pointer; padding: 14px 20px; font-size: 15px; font-weight: 600;
+    display: flex; align-items: center; gap: 10px; list-style: none;
+    border-radius: 14px;
+  }
+  details.whatsnew summary::-webkit-details-marker { display: none; }
+  details.whatsnew summary::after {
+    content: "\203A"; margin-left: auto; font-size: 20px; line-height: 1;
+    color: var(--muted); transition: transform .15s ease;
+  }
+  details.whatsnew[open] summary::after { transform: rotate(90deg); }
+  details.whatsnew summary:hover { color: var(--accent-deep); }
+  details.whatsnew summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  details.whatsnew summary .tag {
+    font-size: 10.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+    padding: 3px 8px; border-radius: 999px; background: var(--accent-wash);
+    color: var(--accent-deep);
+  }
+  details.whatsnew summary .sub { font-size: 13px; font-weight: 400; color: var(--muted); }
+  .wn-body { padding: 0 20px 18px; border-top: 1px solid var(--line); }
+  .wn-body h3 {
+    font-size: 11px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--accent-deep); margin: 18px 0 8px;
+  }
+  .wn-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 10px; }
+  .wn-list li { font-size: 14.5px; padding-left: 18px; position: relative; }
+  .wn-list li::before {
+    content: ""; position: absolute; left: 0; top: 8px; width: 6px; height: 6px;
+    border-radius: 50%; background: var(--accent); opacity: .6;
+  }
+  .wn-list b { font-weight: 600; }
+  .wn-list .say { font-style: italic; color: var(--muted); }
+  .wn-foot { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--line);
+             font-size: 13px; color: var(--muted); }
+  .wn-foot a { color: var(--accent-deep); font-weight: 600; text-decoration: none; }
+  .wn-foot a:hover { text-decoration: underline; }
+
+  .heads-up {
+    display: flex; gap: 12px; align-items: flex-start;
+    background: var(--accent-wash); border-radius: 12px; padding: 16px 18px; margin-top: 18px;
+  }
+  .heads-up .mark { color: var(--accent-deep); font-weight: 700; font-size: 16px; line-height: 1.4; }
+  .heads-up p { margin: 0; font-size: 15px; }
+
+  footer {
+    margin-top: 56px; padding-top: 18px; border-top: 1px solid var(--line);
+    font-size: 14px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 18px;
+  }
+  footer a { color: var(--accent-deep); text-decoration: none; font-weight: 600; }
+  footer a:hover, .download .btn:hover { text-decoration: underline; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .prompt, ol.steps > li { transition: border-color 120ms ease; }
+    .prompt:hover, ol.steps > li:hover { border-color: var(--accent); }
+  }
+</style>
+
+<main>
+  <p class="eyebrow">Internal tool · Solutions Engineering</p>
+  <h1>Talk to Insightly in plain English</h1>
+  <p class="lede">The <strong>Insightly SE MCP</strong> connects Claude to any of our Insightly demo environments. Ask questions, prep demo data, and update records by typing what you want — <strong>no clicking through the CRM.</strong></p>
+
+  <div class="chips">
+    <span class="chip version">Always the latest build</span>
+    <span class="chip">Mac · Claude desktop app</span>
+    <span class="chip">~5 min setup, once</span>
+    <span class="chip">Demo environments</span>
+  </div>
+
+  <div class="download">
+    <a class="btn" href="https://github.com/lukeswade/insightly-mcp/raw/main/dist/insightly-se-mcp-latest.mcpb">Download the extension (.mcpb)</a>
+    <small>This link always serves the newest version — re-download any time to update. Needs the <b>Claude app on your Mac</b> (the one you download and open like any app) — claude.ai in a browser tab won't work. On Windows, or prefer the manual route? Use the <a href="https://github.com/lukeswade/insightly-mcp/blob/main/ONBOARDING.md">step-by-step guide</a> instead.</small>
+  </div>
+
+  <details class="whatsnew">
+    <summary>
+      <span class="tag">What&rsquo;s new</span>
+      Big update since the last version
+      <span class="sub">&mdash; if you installed a while ago, this is what changed</span>
+    </summary>
+    <div class="wn-body">
+      <h3>New: a visual dashboard</h3>
+      <ul class="wn-list">
+        <li>Ask <span class="say">&ldquo;show me the Insightly dashboard&rdquo;</span> and you get an
+          <b>interactive panel right in the chat</b> &mdash; a tile per object with live record counts,
+          instead of a wall of text.</li>
+        <li><b>Click any tile</b> to see that object&rsquo;s newest records, or its full field list
+          (including the valid dropdown values, which is what stops wrong data being created).</li>
+        <li><b>Custom objects get their own cards</b>, named the way your environment names them,
+          with record counts.</li>
+        <li>An <b>Explore</b> row for the setup behind a demo: custom objects, pipelines and their
+          stages, and users with their email addresses.</li>
+      </ul>
+
+      <h3>New: jump straight into Insightly</h3>
+      <ul class="wn-list">
+        <li><b>Record names and IDs are clickable</b> and open that record in Insightly in a new tab,
+          in the side-panel view so you keep your place in the list.</li>
+        <li>A panel&rsquo;s title opens the <b>full list view</b> for that object.</li>
+      </ul>
+
+      <h3>New: work across several environments</h3>
+      <ul class="wn-list">
+        <li><b>Save each demo env once, then switch by name</b> &mdash;
+          <span class="say">&ldquo;switch to my healthcare env&rdquo;</span>. You never paste an API key
+          into the conversation again.</li>
+        <li>In the dashboard, the <b>environment tag is the picker</b> &mdash; click it for every saved
+          env, with the panel reloading in place.</li>
+        <li><b>Add, rename and remove</b> environments from that same menu. Removing only forgets the
+          key saved on your Mac; nothing in Insightly changes.</li>
+      </ul>
+
+      <h3>Bigger jobs, no limits</h3>
+      <ul class="wn-list">
+        <li><b>Export a whole object</b> however large it is &mdash;
+          <span class="say">&ldquo;export all my contacts&rdquo;</span> now runs in the background and
+          reports progress, instead of stopping at a few thousand records.</li>
+        <li><b>Create records in bulk</b> without a per-request cap &mdash;
+          <span class="say">&ldquo;seed 200 sample contacts&rdquo;</span> just works.</li>
+        <li>You can check on, or cancel, anything running.</li>
+      </ul>
+
+      <h3>Better answers, fewer surprises</h3>
+      <ul class="wn-list">
+        <li><b>Counts are now exact.</b> &ldquo;How many opportunities do I have?&rdquo; reads the real
+          total rather than guessing from the first page.</li>
+        <li><b>&ldquo;Newest&rdquo; really means newest.</b> Insightly hands records back oldest-first, so
+          recent-record lists were showing the <i>oldest</i> ones. They now rank on whichever is
+          later, created or updated &mdash; so something you made this morning appears at the top.</li>
+        <li><b>Newest by any date you like</b> &mdash;
+          <span class="say">&ldquo;the 50 most recently closed opportunities&rdquo;</span> ranks on the
+          actual close date, and does it without trawling the whole object.</li>
+        <li><b>Lookup fields become names.</b> A list of organisation IDs can be turned into the
+          organisation names in one step, instead of fetching every record to read one word.</li>
+        <li><b>Search finds more:</b> partial matches, and searching across every field
+          (<span class="say">&ldquo;anything mentioning Acme&rdquo;</span>), not just exact names.</li>
+        <li><b>Link records together</b> &mdash; put a contact into an organisation, and see what a
+          record is already linked to.</li>
+        <li><b>Tickets and products work</b> (they were silently unavailable before), plus far more
+          of the CRM is reachable.</li>
+        <li><b>Safer edits:</b> updates can detect if someone changed the record while you were
+          looking at it, rather than overwriting their work.</li>
+        <li><b>Big answers no longer vanish.</b> A result too large for the chat used to be thrown
+          away with a size warning; now it comes back trimmed, and says how to get the rest.</li>
+        <li><b>See your API budget</b> &mdash; the dashboard shows how many calls you have left today,
+          so a big job never stops for a mystery reason.</li>
+      </ul>
+
+      <h3>Reliability &amp; install</h3>
+      <ul class="wn-list">
+        <li><b>Fixed the breakage</b> where a background update from an outside component stopped new
+          installs from working at all. Versions are now locked so that cannot recur.</li>
+        <li><b>Fixed the greyed-out Install button</b> some Macs showed (it wrongly demanded Python).</li>
+        <li><b>Windows: the installer now includes a Windows path</b> &mdash; not yet confirmed on a
+          real Windows machine, so use the <a href="https://github.com/lukeswade/insightly-mcp/blob/main/ONBOARDING.md">step-by-step guide</a>
+          there and tell Luke how it goes.</li>
+        <li>Speed: reuses one connection and paces itself under Insightly&rsquo;s limits, so
+          record-heavy environments feel much quicker.</li>
+      </ul>
+
+      <div class="wn-foot">
+        <b>Nothing to relearn</b> &mdash; every question you asked before still works the same way.
+        To update, use the download button above and reinstall over the top; your API key is kept.
+        <br>Technically curious? The
+        <a href="https://github.com/lukeswade/insightly-mcp/commits/main">full commit history</a> and
+        <a href="https://github.com/lukeswade/insightly-mcp/blob/main/docs/API-AUDIT.md">API audit notes</a>
+        are in the repo.
+      </div>
+    </div>
+  </details>
+
+  <h2>Install it</h2>
+  <p class="h2-sub">Four steps, one time. You'll need your Insightly API key — in any demo environment, click your <b>profile picture (top right) → User Settings → API</b> and copy the key.</p>
+
+  <ol class="steps">
+    <li>
+      <span class="stepnum">1</span>
+      <div class="stepbody">
+        <h3>Install the helper (one Terminal command)</h3>
+        <p>The extension uses a small runner called <code>uv</code>. Open <b>Terminal</b> (press <kbd>⌘</kbd><kbd>Space</kbd>, type “Terminal”, press <kbd>Return</kbd>). Paste this whole line and press <kbd>Return</kbd>:</p>
+        <pre class="cmd"><code>curl -LsSf https://astral.sh/uv/install.sh | sh &amp;&amp; echo "YOUR UV PATH: $HOME/.local/bin/uv"</code></pre>
+        <p>When it finishes it prints a line starting <b>YOUR UV PATH:</b> — <b>keep Terminal open</b>; you’ll copy that path in step 3. That’s the only Terminal step.</p>
+        <p class="fine">Don’t be alarmed if typing <code>which uv</code> in this same window says “not found” — the install only registers in <b>new</b> Terminal windows. You don’t need to check anything; just copy the printed path.</p>
+        <p class="fine">Homebrew user? <code>brew install uv</code> works too — then in step 3 the pre-filled path is already correct and you can skip the path part.</p>
+      </div>
+    </li>
+    <li>
+      <span class="stepnum">2</span>
+      <div class="stepbody">
+        <h3>Download and double-click the extension</h3>
+        <p>Click the download button above — the file lands in your <b>Downloads</b> folder. Double-click it and Claude opens an install dialog.</p>
+        <p class="fine">Double-click doesn’t open Claude? In Claude go to <b>Settings → Extensions → Advanced settings → Install extension…</b> and pick the file from Downloads.</p>
+      </div>
+    </li>
+    <li>
+      <span class="stepnum">3</span>
+      <div class="stepbody">
+        <h3>Fill in the install dialog (3 fields — you only change 2)</h3>
+        <p><b>Insightly API key:</b> paste the key you copied (profile picture → User Settings → API). Claude stores it securely — it never appears in chat.</p>
+        <p><b>Path to uv:</b> replace what’s there with the path Terminal printed in step 1 (the part after “YOUR UV PATH:”, like <code>/Users/yourname/.local/bin/uv</code>). Used Homebrew instead? Leave it as is.</p>
+        <p class="fine">Leave <b>Insightly pod</b> as <code>na1</code> unless your Insightly URL says otherwise.</p>
+      </div>
+    </li>
+    <li>
+      <span class="stepnum">4</span>
+      <div class="stepbody">
+        <h3>Restart Claude — fully</h3>
+        <p>Press <kbd>⌘</kbd><kbd>Q</kbd> (closing the window isn’t enough), then reopen Claude.</p>
+      </div>
+    </li>
+  </ol>
+
+  <div class="works">
+    <span class="tick">✓</span>
+    <p><b>Check it worked:</b> in a new chat, type <span class="say">“What’s in this Insightly env?”</span> — you should get back a table of real record counts. <b>The very first question can take up to a minute</b> — it’s downloading its own copy of Python and a few packages, one time. After that it’s fast. Nothing after a minute or two? See the fixes below.</p>
+  </div>
+
+  <div class="heads-up">
+    <span class="mark">!</span>
+    <p><b>Already have an Insightly connector switched on?</b> Some accounts have a company-managed Insightly connector (it shows as <b>Custom</b> under Settings → Connectors, with a name like “Insightly (Internal Release)”). It offers <b>some of the same actions by the same names</b>, so Claude may answer from whichever it picks — and the answers can differ. While you’re trying this out, turn the other one off in the chat’s tools menu (the <b>⚒</b> icon under the message box).</p>
+  </div>
+
+  <h2>What you can do — just say it</h2>
+  <p class="h2-sub">These are prompts, not commands — phrase them however you like. Claude picks the right tool.</p>
+
+  <p class="group-label">Get oriented</p>
+  <div class="prompts">
+    <div class="prompt"><span class="say">“What’s in this demo env?”</span><span class="why">Record counts across contacts, orgs, leads, opportunities, tickets, products, and more — in one shot.</span></div>
+    <div class="prompt"><span class="say">“How many open opportunities do we have?”</span><span class="why">Real totals, not a guess from the first page.</span></div>
+    <div class="prompt"><span class="say">“List my 10 most recently updated leads.”</span><span class="why">Genuinely the most recent — ranked on created or updated, whichever is later.</span></div>
+    <div class="prompt"><span class="say">“Which env am I connected to?”</span><span class="why">Shows the environment, region, and tool version.</span></div>
+  </div>
+
+  <p class="group-label">Prep a demo</p>
+  <div class="prompts">
+    <div class="prompt"><span class="say">“Seed 15 sample healthcare contacts with realistic intake statuses.”</span><span class="why">Batch-creates records using the env’s real custom fields and dropdown values.</span></div>
+    <div class="prompt"><span class="say">“Create an organisation called Acme Rockets and a contact Jane Doe in it.”</span><span class="why">Builds linked records in one go.</span></div>
+    <div class="prompt"><span class="say">“What fields does the Opportunity object have here?”</span><span class="why">Lists standard and custom fields — including valid dropdown options.</span></div>
+    <div class="prompt"><span class="say">“Find and delete the contacts named MCP-Test.”</span><span class="why">Cleanup after a demo. Deletes always ask for confirmation first.</span></div>
+  </div>
+
+  <p class="group-label">Find &amp; update</p>
+  <div class="prompts">
+    <div class="prompt"><span class="say">“Find jane@acme.com and add a note that we spoke today.”</span><span class="why">Looks up the contact and attaches the note.</span></div>
+    <div class="prompt"><span class="say">“Find anything mentioning Acme in opportunities.”</span><span class="why">Searches across every field, not just names.</span></div>
+    <div class="prompt"><span class="say">“Update Jane Doe’s intake status to Admitted.”</span><span class="why">Edits the record with a valid option value.</span></div>
+    <div class="prompt"><span class="say">“Switch to my healthcare demo env.”</span><span class="why">Changes environment by name. The key stays saved on your Mac — it never goes in the chat.</span></div>
+  </div>
+
+  <h2>How it works</h2>
+  <p class="h2-sub">Nothing is hosted anywhere — the whole thing runs on your Mac.</p>
+
+  <div class="flow">
+    <div class="node"><b>You ask in chat</b><span>“Seed 15 sample contacts.”</span></div>
+    <span class="arrow">→</span>
+    <div class="node"><b>Claude picks a tool</b><span>The extension gives Claude 30-plus Insightly actions: list, search, create, update, count…</span></div>
+    <span class="arrow">→</span>
+    <div class="node"><b>Your Mac calls Insightly</b><span>Requests go straight to Insightly’s API using your key, and results come back into the chat.</span></div>
+  </div>
+
+  <ul class="plain">
+    <li><b>Your key stays local.</b> It lives in Claude’s secure settings on your Mac and is never shown in chat.</li>
+    <li><b>Full read/write</b> — it can create, edit, and delete. Deletes always require an explicit yes.</li>
+    <li><b>Demo environments only.</b> Point it at demo envs, not customer or production data.</li>
+    <li class="muted">It paces itself under Insightly’s API rate limits, so big requests (“list everything”) just take a few extra seconds.</li>
+  </ul>
+
+  <h2>If something’s off</h2>
+  <div class="tablewrap">
+    <table>
+      <tr><th>Symptom</th><th>Fix</th></tr>
+      <tr>
+        <td>Claude doesn’t seem to have Insightly tools</td>
+        <td>Usually the API key field was left empty during install (Claude skips the extension silently). Open <b>Settings → Extensions → Insightly SE MCP</b>, fill the key, then <b>⌘Q</b> and reopen. Also confirm you’re in the desktop app, not a browser.</td>
+      </tr>
+      <tr>
+        <td>“Unable to connect” the moment you first enable it</td>
+        <td>Common on the very first start — the app sometimes launches before the settings you just typed are applied. Toggle the extension <b>off and on</b> (Settings → Extensions), or <kbd>⌘</kbd><kbd>Q</kbd> and reopen. One retry fixes it; no need to touch Terminal.</td>
+      </tr>
+      <tr>
+        <td>First question never answers, or errors mentioning Python</td>
+        <td>Open a <b>new</b> Terminal window and run <code>uv python install 3.12</code> — it installs the Python the tool runs on. When it finishes, <kbd>⌘</kbd><kbd>Q</kbd> Claude, reopen, ask again. (Usually automatic — this is the manual nudge.)</td>
+      </tr>
+      <tr>
+        <td>“Server disconnected” error</td>
+        <td>The <b>Path to uv</b> setting doesn’t match where the helper actually is on your Mac. Open a <b>new</b> Terminal window, run <code>which uv</code>, copy the path it prints into <b>Settings → Extensions → Insightly SE MCP → Path to uv</b>, then <kbd>⌘</kbd><kbd>Q</kbd> and reopen.</td>
+      </tr>
+      <tr>
+        <td>Answers look wrong, or come from somewhere else</td>
+        <td>Another Insightly connector is probably switched on alongside this one — check <b>Settings → Connectors</b> for a <b>Custom</b> entry such as “Insightly (Internal Release)”. It shares several action names, so Claude may answer from either. Turn the other one off in the chat’s tools menu (<b>⚒</b> under the message box), or disconnect it in Settings. To confirm which one answered, ask: <span class="say">“Run the Insightly connection_info tool.”</span></td>
+      </tr>
+      <tr>
+        <td>Something worked before and broke, or you want the newest version</td>
+        <td>Re-download using the button above (it always serves the newest build), double-click to reinstall over the top — no need to remove the old one — then <kbd>⌘</kbd><kbd>Q</kbd> and reopen. To see what you’re on, ask: <span class="say">“Run the Insightly connection_info tool.”</span></td>
+      </tr>
+    </table>
+  </div>
+
+  <footer>
+    <span>Questions or ideas → Luke Wade (Solutions Engineering)</span>
+    <a href="https://github.com/lukeswade/insightly-mcp">Repository</a>
+    <a href="https://github.com/lukeswade/insightly-mcp/blob/main/ONBOARDING.md">Full setup guide</a>
+  </footer>
+</main>
