@@ -503,6 +503,137 @@ export async function newestRecords(ins: Insightly, o: string, want: number):
               `(within ${ago(hi)}), so the highest ids win`);
 }
 
+/**
+ * Top N records by ANY field, in either direction — the ranking Insightly cannot do.
+ *
+ * Two facts make this affordable on objects far too large to export. First,
+ * /{Object}/Search?field_name=&field_value= filters EXACTLY, server-side, including on
+ * custom fields: on a 362k-organisation org, PayingStatus__c=paying is 14,276 records, a
+ * 25x reduction before a single record is fetched. Second, a one-record request reports
+ * X-Total-Count, so the job can be priced before it is run.
+ *
+ * From there the scan keeps only a bounded heap, never the records, so memory is O(top)
+ * regardless of scale — the thing that made the export path impossible (362k full records
+ * is ~36GB, because custom-field values live in CUSTOMFIELDS and brief strips them).
+ *
+ * Returns null when the work exceeds `budget` pages so the caller can hand it to a
+ * background task instead of stalling a chat turn.
+ */
+export async function rankTopBy(ins: Insightly, o: string, opts: {
+  field: string; direction?: "asc" | "desc"; filterField?: string; filterValue?: string;
+  where?: any[]; top?: number; fields?: string[]; budget?: number;
+  onProgress?: (scanned: number) => void; startPage?: number;
+  /** Inline callers want null when the job is too big to finish now; the background
+   *  ranker wants to walk `budget` pages per tick and be told whether more remain. */
+  bailIfOverBudget?: boolean;
+}): Promise<{ items: any[]; scanned: number; candidates: number | null;
+              pages: number; exhausted: boolean } | null> {
+  const want = Math.min(Math.max(opts.top ?? 25, 1), HYDRATE_MAX);
+  const desc = (opts.direction ?? "desc") === "desc";
+  const filtering = !!(opts.filterField && opts.filterValue !== undefined);
+  const path = filtering ? `/${o}/Search` : `/${o}`;
+  const base: Record<string, unknown> = filtering
+    ? { field_name: opts.filterField, field_value: opts.filterValue } : {};
+
+  // Full records: the interesting columns are nearly always custom, and brief drops them.
+  const perPage = 200;
+  const [, hdrs] = await ins.request("GET", path, { wantHeaders: true,
+    params: { ...base, top: 1, brief: "true", count_total: "true" } });
+  const c = parseInt(hdrs?.["x-total-count"] ?? "", 10);
+  const candidates = Number.isNaN(c) ? null : c;
+  const pagesNeeded = candidates === null ? null : Math.ceil(candidates / perPage);
+  const budget = Math.max(opts.budget ?? 8, 1);
+  if ((opts.bailIfOverBudget ?? true) && pagesNeeded !== null && pagesNeeded > budget) {
+    return null;                                   // caller should hand this to a task
+  }
+
+  const heap: any[] = [];
+  const keyOf = (r: any) => getField(r, opts.field);
+
+  const startPage = opts.startPage ?? 0;
+  let scanned = 0, pages = 0, reachedEnd = false, failed = false;
+
+  // Pages go out three at a time. Full records are ~100KB each, so a 200-record page is
+  // ~20MB — six-wide (the norm elsewhere here) would put 120MB in flight against a 128MB
+  // isolate. Three keeps peak memory sane while still cutting an inline rank from ~16s to
+  // ~6s, which matters because the dashboard abandons any call over 20s. Ordering is
+  // irrelevant: every page feeds the same heap.
+  const LANES = 3;
+  while (pages < budget && !reachedEnd && !failed) {
+    const lanes = Math.min(LANES, budget - pages);
+    const offsets = Array.from({ length: lanes }, (_, i) => (startPage + pages + i) * perPage);
+    const results = await pooled(offsets.map((off) => () => ins.request("GET", path, {
+      params: { ...base, top: perPage, skip: off, brief: "false" } })), LANES);
+    for (const rows of results) {
+      if (rows && !Array.isArray(rows) && rows.error) { failed = true; break; }
+      const batch = Array.isArray(rows) ? rows : [];
+      pages++; scanned += batch.length;
+      for (const r of batch) {
+        if (opts.where?.length && !whereOk(r, opts.where)) continue;
+        const k = keyOf(r);
+        if (k === undefined || k === null || k === "") continue;   // unranked, not "lowest"
+        heap.push(r);
+        if (heap.length > want * 4) { rankSort(heap, o, opts.field, opts.direction); heap.length = want; }
+      }
+      if (batch.length < perPage) { reachedEnd = true; break; }
+    }
+    opts.onProgress?.(scanned);
+  }
+  if (failed) return { items: finish(), scanned, candidates, pages, exhausted: false };
+  const exhausted = reachedEnd
+    || (pagesNeeded !== null && startPage + pages >= pagesNeeded);
+  function finish(): any[] {
+    rankSort(heap, o, opts.field, opts.direction);
+    const top = heap.slice(0, want);
+    return opts.fields?.length ? projectAll(top, [opts.field, ...opts.fields], o) : top;
+  }
+  return { items: finish(), scanned, candidates, pages, exhausted };
+}
+
+/**
+ * Rank in place, best-first, by an arbitrary field. Numbers compare numerically, anything
+ * else lexicographically (ISO dates sort correctly either way), and the record id breaks
+ * ties so a page boundary never reshuffles equal values. Exported because the background
+ * ranker re-ranks the union of each tick's leaders and must use the identical order.
+ */
+export function rankSort(items: any[], o: string, field: string,
+                         direction: "asc" | "desc" = "desc"): any[] {
+  const desc = direction === "desc";
+  items.sort((a, b) => {
+    const ka = getField(a, field), kb = getField(b, field);
+    const sa = String(ka ?? "").trim(), sb = String(kb ?? "").trim();
+    const na = typeof ka === "number" ? ka : Number(sa);
+    const nb = typeof kb === "number" ? kb : Number(sb);
+    let c: number;
+    if (sa !== "" && sb !== "" && !Number.isNaN(na) && !Number.isNaN(nb)) c = na - nb;
+    else c = sa < sb ? -1 : sa > sb ? 1 : 0;
+    if (c === 0) return recordId(b, o) - recordId(a, o);
+    return desc ? -c : c;
+  });
+  return items;
+}
+
+/** where-clause evaluation, kept here so the ranker needs no import cycle. */
+function whereOk(rec: any, where: any[]): boolean {
+  for (const w of where) {
+    const v = w.field ? getField(rec, w.field) : undefined;
+    if (w.contains !== undefined) {
+      const needle = String(w.contains).toLowerCase();
+      if (w.field) {
+        if (v === undefined || v === null || !String(v).toLowerCase().includes(needle)) return false;
+      }
+      continue;
+    }
+    if (w.not_empty && (v === undefined || v === null || String(v).trim() === "" || v === 0)) return false;
+    if (w.equals !== undefined && String(v) !== String(w.equals)) return false;
+    if (w.gte !== undefined && (v === undefined || v === null
+        || String(v) < String(w.gte))) return false;
+    if (w.lte !== undefined && (v === undefined || v === null
+        || String(v) > String(w.lte))) return false;
+  }
+  return true;
+}
+
 export function forwardDated(field: string): boolean {
   return FORWARD_DATED.some((w) => field.includes(w));
 }

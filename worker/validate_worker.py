@@ -642,6 +642,52 @@ def part9_query_engine() -> None:
     s.close()
 
 
+def part10_top_by() -> None:
+    """Ranking by an arbitrary field, in either direction, narrowed server-side."""
+    print("\n10. top_by — ranking by an arbitrary field")
+    s = Server(capabilities={})
+    desc = s.call("top_by", {"object": "Opportunities", "field": "OPPORTUNITY_VALUE",
+                             "direction": "desc", "top": 5, "fields": ["OPPORTUNITY_NAME"]})
+    vals = [r.get("OPPORTUNITY_VALUE") for r in desc.get("items", [])]
+    check("top_by ranks descending by a numeric field",
+          len(vals) == 5 and vals == sorted(vals, reverse=True), f"{vals}")
+    asc = s.call("top_by", {"object": "Opportunities", "field": "OPPORTUNITY_VALUE",
+                            "direction": "asc", "top": 5})
+    av = [r.get("OPPORTUNITY_VALUE") for r in asc.get("items", [])]
+    check("top_by ranks ascending too (smallest / longest-tenured)",
+          len(av) == 5 and av == sorted(av) and av[0] <= vals[-1], f"{av}")
+    dates = s.call("top_by", {"object": "Contacts", "field": "DATE_CREATED_UTC",
+                              "direction": "asc", "top": 5})
+    dv = [str(r.get("DATE_CREATED_UTC")) for r in dates.get("items", [])]
+    check("top_by ranks date fields, oldest first", dv == sorted(dv), f"{dv[:2]}")
+
+    # the whole point: Insightly filters exactly, server-side, so huge objects stay tractable
+    won = s.call("top_by", {"object": "Opportunities", "field": "OPPORTUNITY_VALUE",
+                            "filter_field": "OPPORTUNITY_STATE", "filter_value": "Won",
+                            "top": 5})
+    allc = s.call("top_by", {"object": "Opportunities", "field": "OPPORTUNITY_VALUE", "top": 5})
+    check("filter_field narrows the candidate set server-side",
+          won.get("candidates", 0) > 0 and won["candidates"] < allc.get("candidates", 10**9),
+          f"Won={won.get('candidates')} of {allc.get('candidates')}")
+    check("top_by reports what it filtered and ranked by",
+          "OPPORTUNITY_STATE" in str(won.get("filtered_by"))
+          and "OPPORTUNITY_VALUE" in str(won.get("ranked_by")),
+          f"{won.get('filtered_by')} / {won.get('ranked_by')}")
+    check("a fully-scanned rank reports complete", won.get("complete") is True,
+          f"complete={won.get('complete')} scanned={won.get('scanned')}")
+
+    cf = s.call("top_by", {"object": "Contacts", "field": "No_Such_Field_Xyz__c", "top": 5})
+    check("an unknown ranking field says so instead of returning junk",
+          bool(cf.get("error")) and "describe_object" in str(cf.get("hint")),
+          str(cf.get("error"))[:60])
+    proj = s.call("top_by", {"object": "Opportunities", "field": "OPPORTUNITY_VALUE",
+                             "top": 3, "fields": ["OPPORTUNITY_NAME"]})
+    keys = sorted((proj.get("items") or [{}])[0])
+    check("fields projects the ranked rows",
+          set(keys) <= {"OPPORTUNITY_ID", "OPPORTUNITY_VALUE", "OPPORTUNITY_NAME"}, f"{keys}")
+    s.close()
+
+
 def part5_audit() -> None:
     print("\n5. swagger/API-doc audit fixes")
     s = Server(capabilities={})
@@ -716,6 +762,7 @@ def main() -> int:
     part3_spike2(None)
     part4_apps()
     part5_audit()
+    part10_top_by()
     part6_newest()
     part7_payload()
     part8_projection()

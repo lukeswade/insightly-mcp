@@ -28,6 +28,7 @@ import uuid
 import asyncio
 import pathlib
 from datetime import datetime, timedelta, timezone
+from functools import cmp_to_key
 from typing import Any, Optional
 
 import httpx
@@ -41,7 +42,7 @@ from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one 
 
 from app_ui import ENV_DASHBOARD_HTML
 
-SERVER_VERSION = "3.8.0"
+SERVER_VERSION = "3.9.0"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -1031,6 +1032,22 @@ def _field(rec: Any, name: str) -> Any:
     return None
 
 
+def _project(rec: Any, fields: list, pk: Optional[str] = None) -> dict:
+    """Return only the named fields (top-level or flattened out of CUSTOMFIELDS), with the
+    primary key always along for joining. A field absent from the record's layout is
+    omitted rather than invented — that distinction is often the answer."""
+    if not isinstance(rec, dict):
+        return {}
+    out: dict = {}
+    if pk and rec.get(pk) is not None:
+        out[pk] = rec[pk]
+    for f in fields:
+        v = _field(rec, f)
+        if v is not None:
+            out[str(f)] = v
+    return out
+
+
 def _recency(rec: Any) -> str:
     """Sort key for 'newest': the later of created and updated.
 
@@ -1401,6 +1418,221 @@ def list_supported_objects() -> dict:
     Pricebook are singular, the rest plural; 'Organizations' US spelling also accepted).
     Anything else is reachable via raw_request."""
     return {"objects": COMMON_OBJECTS, "read_only": READONLY, "version": SERVER_VERSION}
+
+
+_RANK_PER_PAGE = 200          # full records are heavy; 200 keeps each page parseable
+_RANK_INLINE_PAGES = 8        # what a chat turn can absorb before it should background
+
+
+def _rank_key(rec: Any, field: str) -> Any:
+    return _field(rec, field)
+
+
+def _rank_sort(items: list, o: str, field: str, direction: str = "desc") -> list:
+    """Rank in place, best-first, by an arbitrary field.
+
+    Deliberately a comparator rather than a sort key: the value follows `direction` but ties
+    ALWAYS break by record id descending (newer first), matching the (recency, id) order the
+    newest-record tools use. A key-plus-reverse implementation flips the tie-break along with
+    the values, which made ascending ranks disagree with the Worker's — caught by parity
+    tests, so both now run this identical comparison.
+    """
+    desc = direction == "desc"
+
+    def compare(a: Any, b: Any) -> int:
+        ka, kb = _rank_key(a, field), _rank_key(b, field)
+        sa = "" if ka is None else str(ka).strip()
+        sb = "" if kb is None else str(kb).strip()
+        na = nb = None
+        if sa != "":
+            try:
+                na = float(sa)
+            except ValueError:
+                na = None
+        if sb != "":
+            try:
+                nb = float(sb)
+            except ValueError:
+                nb = None
+        if na is not None and nb is not None:
+            c = (na > nb) - (na < nb)
+        else:
+            c = (sa > sb) - (sa < sb)
+        if c == 0:
+            return _record_id(b, o) - _record_id(a, o)
+        return -c if desc else c
+
+    items.sort(key=cmp_to_key(compare))
+    return items
+
+
+async def _rank_top_by(o: str, field: str, direction: str, filter_field: Optional[str],
+                       filter_value: Optional[str], where: Optional[list], top: int,
+                       fields: Optional[list], budget: int,
+                       start_page: int = 0, rec: Optional[dict] = None) -> Optional[dict]:
+    """Top `top` records by any field, in either direction.
+
+    Two facts make this affordable on objects far too large to export. /{Object}/Search
+    filters EXACTLY and server-side, custom fields included — PayingStatus__c=paying turns
+    362k organisations into 14k before a record is fetched — and a one-record request
+    reports X-Total-Count, so the job can be priced before it runs. From there only a
+    bounded heap is kept, never the records, so memory is O(top) at any scale.
+
+    Returns None when the work exceeds `budget` pages, so the caller can background it.
+    """
+    filtering = bool(filter_field and filter_value is not None)
+    path = f"/{o}/Search" if filtering else f"/{o}"
+    base: dict = {"field_name": filter_field, "field_value": filter_value} if filtering else {}
+
+    _, hdrs = await _request("GET", path, want_headers=True,
+                             params={**base, "top": 1, "brief": "true", "count_total": "true"})
+    try:
+        candidates = int(hdrs.get("x-total-count"))
+    except (TypeError, ValueError):
+        candidates = None
+    pages_needed = None if candidates is None else -(-candidates // _RANK_PER_PAGE)
+    if rec is None and pages_needed is not None and pages_needed > budget:
+        return None
+
+    heap: list = []
+    scanned = pages = 0
+    reached_end = False
+    while pages < budget:
+        if rec is not None and rec.get("cancel"):
+            break
+        body = await _request("GET", path, params={**base, "top": _RANK_PER_PAGE,
+                                                  "skip": (start_page + pages) * _RANK_PER_PAGE,
+                                                  "brief": "false"})
+        if isinstance(body, dict) and body.get("error"):
+            break
+        batch = body if isinstance(body, list) else []
+        pages += 1
+        scanned += len(batch)
+        for r in batch:
+            if where and not _rank_where(r, where):
+                continue
+            k = _rank_key(r, field)
+            if k is None or k == "":
+                continue          # no value in this field: unranked, not "lowest"
+            heap.append(r)
+            if len(heap) > max(top * 4, 100):
+                _rank_sort(heap, o, field, direction)
+                del heap[top:]
+        if rec is not None:
+            _task_touch(rec, f"ranked {(start_page + pages) * _RANK_PER_PAGE}", progress=scanned)
+        if len(batch) < _RANK_PER_PAGE:
+            reached_end = True
+            break
+
+    _rank_sort(heap, o, field, direction)
+    rows = heap[:top]
+    if fields:
+        rows = [_project(r, [field] + list(fields), PK.get(o)) for r in rows]
+    exhausted = reached_end or (pages_needed is not None
+                                and start_page + pages >= pages_needed)
+    return {"items": rows, "scanned": scanned, "candidates": candidates,
+            "pages": pages, "exhausted": exhausted, "heap": heap}
+
+
+def _rank_where(rec: Any, where: list) -> bool:
+    for w in where or []:
+        v = _field(rec, w.get("field")) if w.get("field") else None
+        if w.get("contains") is not None and w.get("field"):
+            if v is None or str(w["contains"]).lower() not in str(v).lower():
+                return False
+            continue
+        if w.get("not_empty") and (v is None or str(v).strip() == "" or v == 0):
+            return False
+        if w.get("equals") is not None and str(v) != str(w["equals"]):
+            return False
+        if w.get("gte") is not None and (v is None or str(v) < str(w["gte"])):
+            return False
+        if w.get("lte") is not None and (v is None or str(v) > str(w["lte"])):
+            return False
+    return True
+
+
+async def _job_rank(rec: dict, o: str, field: str, direction: str,
+                    filter_field: Optional[str], filter_value: Optional[str],
+                    where: Optional[list], top: int, fields: Optional[list]) -> None:
+    """Walk the whole narrowed set in the background, carrying only the leaders forward."""
+    carried: list = []
+    page = 0
+    while True:
+        res = await _rank_top_by(o, field, direction, filter_field, filter_value, where,
+                                 max(top, 25), None, budget=12, start_page=page, rec=rec)
+        if res is None:
+            _task_finish(rec, "failed", "could not price the rank")
+            rec["items"] = []
+            return
+        carried = _rank_sort(carried + res["heap"], o, field, direction)[:max(top * 4, 100)]
+        page += res["pages"]
+        rec["total"] = res["candidates"]
+        if rec["cancel"]:
+            _task_finish(rec, "cancelled", f"cancelled after {page * _RANK_PER_PAGE} records")
+            rec["items"] = carried[:top]
+            return
+        if res["exhausted"] or res["pages"] == 0:
+            rows = carried[:top]
+            if fields:
+                rows = [_project(r, [field] + list(fields), PK.get(o)) for r in rows]
+            rec["items"] = rows
+            rec["summary"] = {"object": o, "field": field, "direction": direction,
+                              "scanned": rec.get("progress"), "candidates": res["candidates"],
+                              "filtered_by": (f"{filter_field} = {filter_value}"
+                                              if filter_field else None)}
+            _task_finish(rec, "completed", f"ranked {res['candidates']} records")
+            return
+
+
+@mcp.tool()
+async def top_by(object: str, field: str, ctx: Context, direction: str = "desc",
+                 filter_field: Optional[str] = None, filter_value: Optional[str] = None,
+                 where: Optional[list] = None, top: int = 25,
+                 fields: Optional[list] = None) -> Any:
+    """Top N records ranked by ANY field, ascending or descending — the ranking Insightly's
+    API cannot do. This is the tool for "top customers by annual revenue", "longest-tenured
+    accounts", "biggest open deals", "oldest unresolved tickets".
+
+    ALWAYS narrow first with filter_field/filter_value when you can: Insightly filters those
+    EXACTLY and server-side, custom fields included, which is what makes huge objects
+    tractable — 362k organisations become 14k with PayingStatus__c=paying before a single
+    record is fetched. Use describe_object to find the field and its valid values.
+
+    direction: 'desc' (default) for biggest/latest, 'asc' for smallest/earliest — longest
+    tenure is an ASCENDING sort on the start date. Ranking reads full records so custom
+    fields are visible; pass `fields` for just the columns you want. Small jobs answer
+    inline; large ones return a task_id to poll (task_status, then task_result). Records
+    with no value in `field` are excluded rather than ranked as zero."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    o = _obj(object)
+    direction = "asc" if str(direction).lower().startswith("asc") else "desc"
+    want = min(max(int(top), 1), _HYDRATE_MAX)
+    res = await _rank_top_by(o, field, direction, filter_field, filter_value, where, want,
+                             fields, budget=_RANK_INLINE_PAGES)
+    if res is not None:
+        if not res["items"] and res["scanned"]:
+            return {"error": f"no records carry a value in {field}.",
+                    "scanned": res["scanned"], "candidates": res["candidates"],
+                    "hint": f"confirm the field name with describe_object('{o}') — custom "
+                            f"fields end in __c and are case-sensitive."}
+        out = {"object": o, "ranked_by": f"{field} {direction}", "returned": len(res["items"]),
+               "scanned": res["scanned"], "candidates": res["candidates"],
+               "filtered_by": (f"{filter_field} = {filter_value}" if filter_field else None),
+               "complete": res["exhausted"], "basis": "inline"}
+        return _fit(res["items"], out)
+    rec = _task_new("rank", f"{o} by {field} {direction}")
+    _spawn(rec, _job_rank(rec, o, field, direction, filter_field, filter_value, where,
+                          want, fields))
+    return {"task_id": rec["task_id"], "status": rec["status"], "poll_interval_ms": TASK_POLL_MS,
+            "next": f"too many candidates to rank in one turn — running in the background. "
+                    f"task_status('{rec['task_id']}') until completed, then "
+                    f"task_result('{rec['task_id']}') returns the ranked rows.",
+            "hint": None if filter_field else
+                    "a filter_field/filter_value would narrow this server-side and often "
+                    "make it inline."}
 
 @mcp.tool()
 async def newest_by(object: str, date_field: str, ctx: Context, top: int = 50) -> Any:

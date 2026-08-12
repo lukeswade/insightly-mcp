@@ -13,13 +13,14 @@ import { z } from "zod";
 import {
   COMMON_OBJECTS, HYDRATE_MAX, Insightly, LINKABLE, NAME_FIELDS, PAGE_MAX, PK, SCAN_CAP,
   applySort, briefStrip, fetchAll, fit, forwardDated, hydrate, mask, newestByField,
-  newestRecords, obj, pageEnvelope, pooled, project, projectAll, recordContains, sortNewest,
+  newestRecords, obj, pageEnvelope, pooled, project, projectAll, rankTopBy, recordContains,
+  sortNewest,
   sortNewestBasis,
 } from "./insightly";
 import { WIDGET_HTML } from "./widget";
 import { Metric, WhereClause, accumulate, containsAnywhere, finishGroups, matches, referencedFields } from "./query";
 
-export const SERVER_VERSION = "4.3.0-cf";
+export const SERVER_VERSION = "4.4.0-cf";
 const UI_URI = "ui://insightly/env-dashboard.html";
 const SUMMARY_OBJECTS = ["Contacts", "Organisations", "Leads", "Opportunities", "Projects",
   "Tasks", "Events", "Notes", "Emails", "Ticket", "Product", "KnowledgeArticle", "Users"];
@@ -734,6 +735,60 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
       next: `big object — aggregating in the background at the API's rate ceiling. ` +
             `task_status('${r.task_id}') until completed, then task_result('${r.task_id}') ` +
             `returns the grouped table.` });
+  });
+
+  server.registerTool("top_by", {
+    description: "Top N records ranked by ANY field, ascending or descending — the ranking " +
+      "Insightly's API cannot do. This is the tool for \"top customers by annual revenue\", " +
+      "\"longest-tenured accounts\", \"biggest open deals\", \"oldest unresolved tickets\".\n" +
+      "ALWAYS narrow first with filter_field/filter_value when you can: Insightly filters " +
+      "those EXACTLY and server-side, including custom fields, which is what makes huge " +
+      "objects tractable — 362k organisations become 14k with PayingStatus__c=paying before " +
+      "a single record is fetched. Use describe_object to find the field and its valid " +
+      "values.\n" +
+      "direction: 'desc' (default) for biggest/latest, 'asc' for smallest/earliest — " +
+      "longest tenure is an ASCENDING sort on the start date. Ranking reads full records so " +
+      "custom fields are visible; pass `fields` to get back only the columns you want. " +
+      "Small jobs answer inline; large ones return a task_id to poll (task_status, then " +
+      "task_result) instead of stalling. Records with no value in `field` are excluded " +
+      "rather than ranked as zero.",
+    inputSchema: z.object({
+      object: z.string(), field: z.string(),
+      direction: z.enum(["asc", "desc"]).optional(),
+      filter_field: z.string().optional(), filter_value: z.string().optional(),
+      where: whereSchema, top: z.number().int().optional(),
+      fields: z.array(z.string()).optional(),
+    }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const o = obj(a.object);
+    const opts = { field: a.field, direction: a.direction ?? "desc",
+                   filterField: a.filter_field, filterValue: a.filter_value,
+                   where: a.where, top: a.top ?? 25, fields: a.fields };
+    const inline = await rankTopBy(ins, o, { ...opts, budget: 8 });
+    if (inline) {
+      if (inline.items.length === 0 && inline.scanned > 0) {
+        return T({ error: `no records carry a value in ${a.field}.`,
+                   scanned: inline.scanned, candidates: inline.candidates,
+                   hint: `confirm the field name with describe_object('${o}') — custom ` +
+                         "fields end in __c and are case-sensitive." });
+      }
+      return T(fit(inline.items, {
+        object: o, ranked_by: `${a.field} ${opts.direction}`,
+        returned: inline.items.length, scanned: inline.scanned,
+        candidates: inline.candidates,
+        filtered_by: a.filter_field ? `${a.filter_field} = ${a.filter_value}` : null,
+        complete: inline.exhausted, basis: "inline" }));
+    }
+    const r = await taskCall(env, sess(), { op: "start_rank",
+      detail: `${o} by ${a.field} ${opts.direction}`, params: { o, opts } });
+    if (r.error) return T(r);
+    return T({ task_id: r.task_id, status: r.status, poll_interval_ms: 500,
+      next: `too many candidates to rank in one turn — running in the background. ` +
+            `task_status('${r.task_id}') until completed, then task_result('${r.task_id}') ` +
+            `returns the ranked rows.`,
+      hint: a.filter_field ? undefined
+        : "a filter_field/filter_value would narrow this server-side and often make it inline." });
   });
 
   server.registerTool("task_query", {

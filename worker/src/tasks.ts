@@ -14,7 +14,8 @@
  * blow a per-value limit if chunked by count. Aggregation tasks store no records at all:
  * they stream pages through a group accumulator and persist only the running totals.
  */
-import { Insightly, PAGE_MAX, PK, briefStrip, fit, pooled, projectAll } from "./insightly";
+import { Insightly, PAGE_MAX, PK, briefStrip, fit, pooled, projectAll, rankSort,
+         rankTopBy } from "./insightly";
 import { GroupState, Metric, TopN, WhereClause, accumulate, finishGroups, getField,
          matches, referencedFields, sortByField } from "./query";
 
@@ -112,10 +113,12 @@ export class TaskDO {
     const op = body.op as string;
     const respond = (x: unknown) => Response.json(x as any);
 
-    if (op === "start_export" || op === "start_bulk" || op === "start_aggregate") {
+    if (op === "start_export" || op === "start_bulk" || op === "start_aggregate"
+        || op === "start_rank") {
       const tid = crypto.randomUUID().replace(/-/g, "").slice(0, 12);
       const kind = op === "start_export" ? "export"
-        : op === "start_bulk" ? "bulk_create" : "aggregate";
+        : op === "start_bulk" ? "bulk_create"
+        : op === "start_rank" ? "rank" : "aggregate";
       const m: Meta = {
         task_id: tid, kind, detail: body.detail, status: "working", status_message: "queued",
         created_at: now(), last_updated_at: now(), done_at: null,
@@ -371,6 +374,44 @@ export class TaskDO {
         }
       }
       return;   // more work next tick
+    }
+
+    if (m.kind === "rank") {
+      // Resume where the last tick stopped and keep only the heap, so a 14k-record rank
+      // costs O(top) storage no matter how many pages it walks.
+      const { o, opts } = m.params;
+      const startPage = m.params.page ?? 0;
+      const carried: any[] = m.params.heap ?? [];
+      const res = await rankTopBy(ins, o, { ...opts, budget: 12, startPage,
+        bailIfOverBudget: false, top: Math.max(opts.top ?? 25, 25) });
+      if (res === null) { await this.finish(m, "failed", "could not price the rank"); return; }
+      // Merge the previous leaders with this tick's and re-rank locally — no extra calls.
+      const union = rankSort([...carried, ...res.items], o, opts.field, opts.direction)
+        .slice(0, Math.max((opts.top ?? 25) * 4, 100));
+      m.params.heap = union;
+      m.params.page = startPage + res.pages;
+      m.count = union.length;
+      m.progress = (m.params.scanned ?? 0) + res.scanned;
+      m.params.scanned = m.progress;
+      m.total = res.candidates;
+      m.status_message = `ranked ${m.progress}${m.total ? ` of ${m.total}` : ""}`;
+      if (m.cancel) { await this.finish(m, "cancelled", `cancelled after ${m.progress}`); return; }
+      if (res.exhausted || res.pages === 0) {
+        const wanted = opts.top ?? 25;
+        const ranked = opts.fields?.length
+          ? projectAll(union.slice(0, wanted), [opts.field, ...opts.fields], o)
+          : union.slice(0, wanted);
+        m.count = 0; m.chunks = 0; m.chunk_rows = [];
+        await this.appendRows(m, ranked);
+        m.summary = { object: o, field: opts.field, direction: opts.direction ?? "desc",
+                      scanned: m.progress, candidates: res.candidates,
+                      filtered_by: opts.filterField
+                        ? `${opts.filterField} = ${opts.filterValue}` : null };
+        await this.finish(m, "completed", `ranked ${m.progress} records`);
+        return;
+      }
+      await this.putMeta(m);
+      return;
     }
 
     if (m.kind === "bulk_create") {
