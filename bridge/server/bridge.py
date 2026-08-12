@@ -19,6 +19,7 @@ advertises these tools), so the host and the dashboard widget see one coherent s
 import json
 import os
 import pathlib
+import platform
 import sys
 import threading
 
@@ -376,7 +377,27 @@ def schema_watchdog() -> None:
             emit({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
 
 
+def preflight() -> None:
+    """Say enough on stderr that Claude's log alone explains a failed start.
+
+    A bridge that dies before this prints means the launcher never reached Python at all
+    (uv missing from PATH, or uv could not provision a Python) — which is itself the most
+    useful thing the log can tell us.
+    """
+    log(f"python {sys.version.split()[0]} on {platform.system()} {platform.release()}")
+    log(f"executable: {sys.executable}")
+    log(f"httpx {httpx.__version__}")
+    log(f"target: {URL}")
+    log(f"keystore: {KEYS_FILE} (exists={os.path.exists(KEYS_FILE)})")
+    try:
+        r = _client.get(URL.rsplit("/mcp", 1)[0] + "/", timeout=20)
+        log(f"worker reachable: HTTP {r.status_code}")
+    except Exception as e:                                     # noqa: BLE001
+        log(f"WORKER UNREACHABLE: {e} — check network/proxy access to *.workers.dev")
+
+
 def main() -> None:
+    preflight()
     boot_session()
     threading.Thread(target=schema_watchdog, daemon=True).start()
     log(f"bridging stdio <-> {URL} (active env: {ACTIVE['name'] or 'none'})")

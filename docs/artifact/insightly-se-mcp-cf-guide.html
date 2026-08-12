@@ -181,7 +181,7 @@
     instead of a re-download.</p>
 
   <div class="chips">
-    <span class="chip version">Worker 4.2.0-cf · bridge 0.3.0</span>
+    <span class="chip version">Worker 4.2.0-cf · bridge 0.3.1</span>
     <span class="chip">macOS + Windows</span>
     <span class="chip">Claude desktop app</span>
     <span class="chip">104 automated checks</span>
@@ -339,8 +339,8 @@
         <h4>Install <code>uv</code> (one PowerShell command)</h4>
         <p>Press <kbd>Win</kbd>, type <b>PowerShell</b>, open it, then paste this line and press <kbd>Enter</kbd>:</p>
         <pre class="cmd"><code>powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"</code></pre>
-        <p>It installs to <code>%USERPROFILE%\.local\bin</code> and adds that to your PATH. <b>Close PowerShell when it finishes</b> — the PATH change only applies to programs started afterwards, which is why the next step matters.</p>
-        <p class="fine">Verify if you like: open a <b>new</b> PowerShell window and run <code>uv --version</code>.</p>
+        <p>It installs to <code>%USERPROFILE%\.local\bin\uv.exe</code> and adds that folder to your PATH. <b>Close PowerShell when it finishes</b> — the PATH change only reaches programs started afterwards, which is why the next step matters.</p>
+        <p class="fine">Confirm it worked: open a <b>new</b> PowerShell window and run <code>uv --version</code>. Also note the exact path it installed to — if Claude later says “Server disconnected”, you paste that path into the install dialog and the problem goes away.</p>
       </div>
     </li>
     <li>
@@ -363,7 +363,7 @@
       <div class="stepbody">
         <h4>Fill in the dialog, then restart Claude again</h4>
         <p><b>Insightly API key</b> — paste the key. <b>Name this environment</b> — a short label like <code>demo1</code>.</p>
-        <p><b>Ignore “Path to uv”</b> — it is macOS-only; Windows finds uv on PATH. Leave <b>pod</b> as <code>na1</code> and the server URL as-is.</p>
+        <p><b>Path to uv (macOS)</b> — ignore this one entirely. <b>Path to uv (Windows)</b> — leave it as <code>uv</code> for now; it works whenever uv is on your PATH. Leave <b>pod</b> as <code>na1</code> and the server URL as-is.</p>
         <p>Then quit from the system tray once more and reopen.</p>
       </div>
     </li>
@@ -443,7 +443,7 @@
       </tr>
       <tr>
         <td>“Server disconnected”, or the first question never returns</td>
-        <td><b>macOS:</b> the <b>Path to uv</b> value is wrong — run <code>which uv</code> in a <b>new</b> Terminal window and paste what it prints. <b>Windows:</b> uv is not on PATH yet for Claude — quit Claude from the system tray (not just the window) and reopen, having opened a fresh PowerShell to confirm <code>uv --version</code> works.</td>
+        <td><b>macOS:</b> the <b>Path to uv (macOS)</b> value is wrong — run <code>which uv</code> in a <b>new</b> Terminal window and paste what it prints.<br><b>Windows</b>, in order: (1) quit Claude from the <b>system tray</b>, not just the window, and reopen — a running Claude never sees a new PATH; (2) still failing, open <b>Settings → Extensions → Insightly SE MCP — Bridge (TEST)</b> and set <b>Path to uv (Windows)</b> to the full path, normally <code>C:\Users\&lt;you&gt;\.local\bin\uv.exe</code>, then restart Claude again; (3) still failing, click <b>View Logs</b> on that extension and send Luke the last 20 lines — the bridge prints its Python version, httpx version and whether it can reach the Worker, so the log says exactly which step broke.</td>
       </tr>
       <tr>
         <td>Answers look inconsistent between questions</td>
