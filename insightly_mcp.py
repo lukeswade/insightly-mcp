@@ -41,7 +41,7 @@ from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one 
 
 from app_ui import ENV_DASHBOARD_HTML
 
-SERVER_VERSION = "3.7.0"
+SERVER_VERSION = "3.7.2"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -329,7 +329,7 @@ async def app_records(object: str, ctx: Context, top: int = 25,
     out.pop("next_skip", None)
     out["has_more"] = bool(total is not None and total > len(items))
     out = _fit(out.pop("items", []), out)
-    out["sorted_by"] = order_by or "most recently created or updated, newest first"
+    out["sorted_by"] = order_by or _sort_newest_basis(items)
     out["basis"] = basis
     if total is not None:
         out["total"] = total
@@ -942,7 +942,7 @@ async def _newest_records(o: str, want: int) -> tuple:
 
     # Everything the object has is in the page we just read: sorting it is exact.
     if total is None or total <= len(items):
-        return _sort_newest(items)[:want], total, "exact"
+        return _sort_newest(items, o)[:want], total, "exact"
 
     for days in _RECENT_WINDOWS:
         since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
@@ -951,16 +951,31 @@ async def _newest_records(o: str, want: int) -> tuple:
             break                       # this object has no /Search — use the tail instead
         if len(found) >= want:
             basis = f"changed in the last {days}d"
-            return _sort_newest(found)[:want], total, (basis if complete else basis + " (capped)")
+            return _sort_newest(found, o)[:want], total, (basis if complete else basis + " (capped)")
 
     # No /Search, or nothing recent enough to fill the list. Ascending id order puts the
     # newest CREATED records on the last page — far closer to "newest" than page 1.
     tail = await _request("GET", f"/{o}", params={"top": want, "skip": max(0, total - want),
                                                   "brief": "true"})
     if isinstance(tail, dict) and tail.get("error"):
-        return _sort_newest(items)[:want], total, "oldest page only"
+        return _sort_newest(items, o)[:want], total, "oldest page only"
     tail = _brief_strip(tail if isinstance(tail, list) else [])
-    return _sort_newest(tail)[:want], total, "newest by id"
+    return _sort_newest(tail, o)[:want], total, "newest by id"
+
+
+def _field(rec: Any, name: str) -> Any:
+    """Field lookup that also sees CUSTOMFIELDS — a custom object can carry its change
+    stamps there rather than at the top level."""
+    if not isinstance(rec, dict):
+        return None
+    want = name.lower()
+    for k, v in rec.items():
+        if k.lower() == want and k != "CUSTOMFIELDS":
+            return v
+    for c in (rec.get("CUSTOMFIELDS") or []):
+        if isinstance(c, dict) and str(c.get("FIELD_NAME", "")).lower() == want:
+            return c.get("FIELD_VALUE")
+    return None
 
 
 def _recency(rec: Any) -> str:
@@ -973,12 +988,49 @@ def _recency(rec: Any) -> str:
     lexicographically; a missing pair sorts last (empty string)."""
     if not isinstance(rec, dict):
         return ""
-    return max(str(rec.get("DATE_UPDATED_UTC") or ""), str(rec.get("DATE_CREATED_UTC") or ""))
+    best = ""
+    for f in ("DATE_UPDATED_UTC", "DATE_CREATED_UTC"):
+        v = _field(rec, f)
+        if v not in (None, ""):
+            best = max(best, str(v))
+    return best
 
 
-def _sort_newest(items: list) -> list:
-    """Newest first by _recency. Stable, and never mutates the caller's list."""
-    return sorted(items, key=_recency, reverse=True)
+def _record_id(rec: Any, o: Optional[str] = None) -> int:
+    """Numeric primary key, for ordering when the dates cannot decide it."""
+    if not isinstance(rec, dict):
+        return -1
+    pk = PK.get(o or "")
+    raw = rec.get(pk) if pk and pk in rec else next(
+        (rec[k] for k in rec if k.upper().endswith("_ID")), None)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _sort_newest(items: list, o: Optional[str] = None) -> list:
+    """Newest first — and never silently a no-op.
+
+    Comparing recency alone left records with no usable date (or with equal dates) in the
+    API's ascending-id order: the OLDEST first, under a label promising the newest.
+    Insightly ids increase with creation, so the id both breaks ties and stands in when no
+    record carries a date."""
+    return sorted(items, key=lambda r: (_recency(r), _record_id(r, o)), reverse=True)
+
+
+def _sort_newest_basis(items: list) -> str:
+    """What the ordering actually rests on, so callers can say so rather than assume."""
+    if not items:
+        return "most recently created or updated, newest first"
+    dated = sum(1 for r in items if _recency(r))
+    if dated == 0:
+        return ("id descending — these records carry no created/updated date, so newest is "
+                "inferred from the record id")
+    if dated < len(items):
+        return (f"most recently created or updated, newest first ({len(items) - dated} of "
+                f"{len(items)} records carry no date and sort last by id)")
+    return "most recently created or updated, newest first"
 
 
 def _apply_sort(items: Any, order_by: Optional[str]) -> Any:
@@ -1382,7 +1434,7 @@ async def newest_records(object: str, ctx: Context, top: int = 25) -> Any:
         return items
     items, note = await _hydrate(o, items)
     out = {"returned": len(items), "detail_level": note,
-           "sorted_by": "most recently created or updated, newest first", "basis": basis}
+           "sorted_by": _sort_newest_basis(items), "basis": basis}
     if total is not None:
         out["total"] = total
     return _fit(items, out)
@@ -1520,7 +1572,7 @@ async def filter_records(object: str, contains: str, ctx: Context, field_name: O
         return res
     needle = (contains or "").lower()
     hits = [r for r in res["items"] if _record_contains(r, needle, field_name)]
-    hits = _sort_newest(hits)
+    hits = _sort_newest(hits, _obj(object))
     return _fit(hits, {"matched": len(hits), "scanned": res.get("total_fetched", 0),
                        "scanned_from": "newest", "searched_fields": "every field" if not brief
                        else "top-level fields only (brief=true skips DETAILS/CUSTOMFIELDS)",

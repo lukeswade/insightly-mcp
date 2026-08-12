@@ -841,6 +841,8 @@ ENV_DASHBOARD_HTML = """<!doctype html>
   function showPipelines() {
     loading("Pipelines");
     Promise.all([
+      // list_records is fine here: stagesView/pipelinesView impose their own order, and
+      // newest_records would hydrate every row with a per-record GET.
       callTool("app_records", { object: "Pipelines", top: 100 }, "list_records"),
       callTool("app_records", { object: "PipelineStages", top: 500 }, "list_records")
     ]).then(function (r) {
@@ -882,13 +884,17 @@ ENV_DASHBOARD_HTML = """<!doctype html>
     var actions = '<button data-fields="' + esc(obj) + '">Fields</button>'
       + '<button data-ask="Summarise the ' + esc(title) + ' in this Insightly environment and flag anything that looks off.">Ask in chat</button>';
     loading(title);
-    callTool("app_records", { object: obj, top: 25 }, "list_records")
+    callTool("app_records", { object: obj, top: 25 }, "newest_records")
       .then(function (r) {
         var items = r.items || [];
         var known = state.data && state.data.counts ? state.data.counts[obj] : null;
-        var total = known != null ? known : (r.total != null ? r.total : items.length);
-        var head = '<div class="chips" style="margin-bottom:10px"><span class="chip"><b>'
-          + fmt(total) + '</b> total</span><span class="chip">showing newest ' + items.length + '</span>'
+        // Only claim a total we actually have. Falling back to items.length reported the
+        // PAGE SIZE as the total, so a 189k-record object announced "25 total".
+        var total = known != null ? known : (r.total != null ? r.total : null);
+        var head = '<div class="chips" style="margin-bottom:10px">'
+          + (total != null ? '<span class="chip"><b>' + fmt(total) + '</b> total</span>'
+                           : '<span class="chip">' + items.length + '+ records</span>')
+          + '<span class="chip">showing newest ' + items.length + '</span>'
           + (title !== obj ? '<span class="chip">' + esc(obj) + '</span>' : '') + '</div>';
         panel(title, head + recordsTable(items, obj), actions, listUrl(obj));
       })
@@ -905,11 +911,14 @@ ENV_DASHBOARD_HTML = """<!doctype html>
 
   function showExplore(obj) {
     loading(obj);
-    callTool("app_records", { object: obj, top: 50 }, "list_records")
+    callTool("app_records", { object: obj, top: 50 }, "newest_records")
       .then(function (r) {
         var items = r.items || [];
         panel(displayName(obj), '<div class="chips" style="margin-bottom:10px"><span class="chip"><b>'
-          + items.length + '</b> found</span></div>' + recordsTable(items, obj),
+          + items.length + '</b> found</span>'
+          + (r.total != null && r.total > items.length
+               ? '<span class="chip">of ' + fmt(r.total) + ' total</span>' : '')
+          + '</div>' + recordsTable(items, obj),
           '<button data-fields="' + esc(obj) + '">Fields</button>', listUrl(obj));
       })
       .catch(function (e) { failed(obj, e, "List the " + obj + " in this Insightly environment."); });

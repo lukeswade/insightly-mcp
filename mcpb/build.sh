@@ -93,6 +93,24 @@ if missing:
     print(f"ERROR: widget script reads ids that do not exist: {missing}", file=sys.stderr)
     raise SystemExit(1)
 print(f"widget element references all resolve ({len(used)} ids)")
+
+# The inline script is never compiled by anything in this repo's toolchain, so a syntax
+# error ships silently and the widget renders as raw static HTML with no behaviour. That
+# has now happened twice (an escaped apostrophe, then a stray quote from an edit). Parse it.
+script = re.search(r"<script>\s*(.*?)\s*</script>", html, re.S)
+if not script:
+    print("ERROR: no inline <script> found in the widget", file=sys.stderr)
+    raise SystemExit(1)
+import subprocess, tempfile
+with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as fh:
+    fh.write(script.group(1))
+    tmp = fh.name
+chk = subprocess.run(["node", "--check", tmp], capture_output=True, text=True)
+if chk.returncode != 0:
+    print("ERROR: widget inline script does not parse:", file=sys.stderr)
+    print(chk.stderr.strip()[:800], file=sys.stderr)
+    raise SystemExit(1)
+print("widget inline script parses")
 PYUI
 
 MCPB=(npx -y @anthropic-ai/mcpb)

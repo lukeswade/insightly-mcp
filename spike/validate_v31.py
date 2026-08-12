@@ -369,13 +369,27 @@ def part6_newest() -> None:
     def recency(r):
         return max(str(r.get("DATE_UPDATED_UTC") or ""), str(r.get("DATE_CREATED_UTC") or ""))
 
-    want = [r["TASK_ID"] for r in sorted(items, key=recency, reverse=True)[:25]]
+    # (recency, id) — the server's documented total order. Recency alone is tie-dependent:
+    # pv2 has three Tasks stamped the same second across the 25-record boundary, so a
+    # recency-only expectation picks an arbitrary tie-mate and the check flaps.
+    want = [r["TASK_ID"] for r in
+            sorted(items, key=lambda r: (recency(r), r["TASK_ID"]), reverse=True)[:25]]
     got = s.call("app_records", {"object": "Tasks", "top": 25})
     ids = [r.get("TASK_ID") for r in got.get("items", [])]
     check("app_records returns the genuinely newest records",
           set(ids) == set(want), f"overlap={len(set(ids) & set(want))}/25 basis={got.get('basis')}")
     keys = [recency(r) for r in got.get("items", [])]
     check("newest first, oldest last", keys == sorted(keys, reverse=True))
+    # The ordering must not silently degrade to the API's ascending-id order when dates
+    # tie or are missing — that is what put the OLDEST records under a "newest" label.
+    tied = [r for r in got.get("items", []) if recency(r) == recency(got["items"][0])]
+    check("equal timestamps break by id descending, never by API order",
+          len(tied) < 2 or [r["TASK_ID"] for r in tied] == sorted(
+              [r["TASK_ID"] for r in tied], reverse=True),
+          f"{len(tied)} records share the newest timestamp")
+    check("sorted_by states what the ordering actually rests on",
+          "newest first" in str(got.get("sorted_by")) or "id descending" in str(got.get("sorted_by")),
+          str(got.get("sorted_by"))[:70])
     check("ranked on created OR updated, whichever is later",
           "created or updated" in str(got.get("sorted_by")), str(got.get("sorted_by")))
     check("no misleading next_skip on a recency-ranked list", "next_skip" not in got)

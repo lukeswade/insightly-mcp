@@ -9,6 +9,8 @@
  *   - No process state: the key/pod arrive per request; quota is read live.
  */
 
+import { getField } from "./query";
+
 // ------------------------------------------------------------------ constants (ported)
 export const PAGE_MAX = 500;
 export const FETCH_ALL_HARD_CAP = 5000;
@@ -196,12 +198,59 @@ export function briefStrip(data: any): any {
 
 export function recency(rec: any): string {
   if (!rec || typeof rec !== "object") return "";
-  const u = String(rec.DATE_UPDATED_UTC ?? ""), c = String(rec.DATE_CREATED_UTC ?? "");
-  return u > c ? u : c;
+  // Resolve through the same flattening as projection: a custom object can carry its
+  // change stamps inside CUSTOMFIELDS rather than at the top level.
+  let best = "";
+  for (const f of ["DATE_UPDATED_UTC", "DATE_CREATED_UTC"]) {
+    const v = getField(rec, f);
+    if (v !== undefined && v !== null && v !== "") {
+      const str = String(v);
+      if (str > best) best = str;
+    }
+  }
+  return best;
 }
 
-export function sortNewest(items: any[]): any[] {
-  return [...items].sort((a, b) => (recency(a) < recency(b) ? 1 : recency(a) > recency(b) ? -1 : 0));
+/** Numeric primary key, for ordering when dates cannot decide it. */
+export function recordId(rec: any, o?: string): number {
+  if (!rec || typeof rec !== "object") return -1;
+  const pk = o ? PK[o] : undefined;
+  const raw = pk !== undefined && rec[pk] !== undefined
+    ? rec[pk]
+    : rec[Object.keys(rec).find((k) => k.toUpperCase().endsWith("_ID")) ?? ""];
+  const n = typeof raw === "number" ? raw : Number(String(raw));
+  return Number.isNaN(n) ? -1 : n;
+}
+
+/**
+ * Newest first — and never silently a no-op.
+ *
+ * The old version compared only recency, so records with no usable date (or with equal
+ * dates) kept the API's ascending-id order: the OLDEST first, under a label promising the
+ * newest. Insightly ids increase with creation, so the id is a sound decider both as a
+ * tie-break and as a whole-list fallback. `sortNewestBasis` reports which was used so
+ * callers can say so out loud instead of guessing.
+ */
+export function sortNewest(items: any[], o?: string): any[] {
+  return [...items].sort((a, b) => {
+    const ra = recency(a), rb = recency(b);
+    if (ra !== rb) return ra < rb ? 1 : -1;
+    return recordId(b, o) - recordId(a, o);
+  });
+}
+
+export function sortNewestBasis(items: any[]): string {
+  if (!items.length) return "most recently created or updated, newest first";
+  const dated = items.filter((r) => recency(r) !== "").length;
+  if (dated === 0) {
+    return "id descending — these records carry no created/updated date, so newest is " +
+           "inferred from the record id";
+  }
+  if (dated < items.length) {
+    return `most recently created or updated, newest first (${items.length - dated} of ` +
+           `${items.length} records carry no date and sort last by id)`;
+  }
+  return "most recently created or updated, newest first";
 }
 
 export function applySort(items: any, orderBy?: string | null): any {
@@ -357,7 +406,7 @@ export async function newestRecords(ins: Insightly, o: string, want: number):
   const items = briefStrip(Array.isArray(body) ? body : []);
   const total = parseInt(hdrs?.["x-total-count"] ?? "", 10);
   const totalN = Number.isNaN(total) ? null : total;
-  if (totalN === null || totalN <= items.length) return [sortNewest(items).slice(0, want), totalN, "exact"];
+  if (totalN === null || totalN <= items.length) return [sortNewest(items, o).slice(0, want), totalN, "exact"];
 
   for (const days of RECENT_WINDOWS) {
     const since = daysAgo(days);
@@ -365,13 +414,13 @@ export async function newestRecords(ins: Insightly, o: string, want: number):
     if (found === null) break;
     if (found.length >= want) {
       const basis = `changed in the last ${days}d`;
-      return [sortNewest(found).slice(0, want), totalN, complete ? basis : basis + " (capped)"];
+      return [sortNewest(found, o).slice(0, want), totalN, complete ? basis : basis + " (capped)"];
     }
   }
   const tail = await ins.request("GET", `/${o}`, {
     params: { top: want, skip: Math.max(0, totalN - want), brief: "true" } });
-  if (tail && !Array.isArray(tail) && tail.error) return [sortNewest(items).slice(0, want), totalN, "oldest page only"];
-  return [sortNewest(briefStrip(Array.isArray(tail) ? tail : [])).slice(0, want), totalN, "newest by id"];
+  if (tail && !Array.isArray(tail) && tail.error) return [sortNewest(items, o).slice(0, want), totalN, "oldest page only"];
+  return [sortNewest(briefStrip(Array.isArray(tail) ? tail : []), o).slice(0, want), totalN, "newest by id"];
 }
 
 export function forwardDated(field: string): boolean {

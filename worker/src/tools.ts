@@ -14,11 +14,12 @@ import {
   COMMON_OBJECTS, HYDRATE_MAX, Insightly, LINKABLE, NAME_FIELDS, PAGE_MAX, PK, SCAN_CAP,
   applySort, briefStrip, fetchAll, fit, forwardDated, hydrate, mask, newestByField,
   newestRecords, obj, pageEnvelope, pooled, project, projectAll, recordContains, sortNewest,
+  sortNewestBasis,
 } from "./insightly";
 import { WIDGET_HTML } from "./widget";
 import { Metric, WhereClause, accumulate, containsAnywhere, finishGroups, matches, referencedFields } from "./query";
 
-export const SERVER_VERSION = "4.2.0-cf";
+export const SERVER_VERSION = "4.2.2-cf";
 const UI_URI = "ui://insightly/env-dashboard.html";
 const SUMMARY_OBJECTS = ["Contacts", "Organisations", "Leads", "Opportunities", "Projects",
   "Tasks", "Events", "Notes", "Emails", "Ticket", "Product", "KnowledgeArticle", "Users"];
@@ -252,7 +253,7 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
     const rows = projectAll(full, a.fields?.length ? a.fields : undefined, o);
     const out: Record<string, any> = { returned: rows.length,
       detail_level: a.fields?.length ? `projected to ${a.fields.length} fields` : note,
-      sorted_by: "most recently created or updated, newest first", basis };
+      sorted_by: sortNewestBasis(rows), basis };
     if (total !== null) out.total = total;
     return T(fit(rows, out));
   });
@@ -356,7 +357,7 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
     if (res.error && !(res.items as any[])?.length) return T(res);
     const needle = String(a.contains ?? "").toLowerCase();
     const hits = projectAll(
-      sortNewest((res.items as any[]).filter((r) => recordContains(r, needle, a.field_name))),
+      sortNewest((res.items as any[]).filter((r) => recordContains(r, needle, a.field_name)), obj(a.object)),
       a.fields?.length ? a.fields : undefined, obj(a.object));
     return T(fit(hits, { matched: hits.length, scanned: res.total_fetched,
       scanned_from: "newest",
@@ -900,7 +901,7 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
     let rows = items as any[];
     if (a.order_by) rows = applySort(rows, a.order_by);
     const out: Record<string, any> = { returned: rows.length,
-      sorted_by: a.order_by ?? "most recently created or updated, newest first",
+      sorted_by: a.order_by ?? sortNewestBasis(rows),
       basis, top: page, skip: 0 };
     if (total !== null) out.total = total;
     out.has_more = total !== null && total > rows.length;
