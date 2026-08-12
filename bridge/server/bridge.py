@@ -66,17 +66,41 @@ def mask(k) -> str:
 
 
 def boot_session() -> None:
-    """Same semantics as the classic server: an extension-config key becomes the active
-    session, labelled with its saved name when the key matches one."""
+    """Adopt the key from the install dialog AND persist it under the name the user chose.
+
+    A first-time installer has no keystore, so without this they land connected-to-nothing
+    with an empty environment picker — the exact dead end a new user hits. Writing the
+    named entry on first boot means the picker, switching, and the dashboard all work from
+    the very first question.
+    """
     env_key = os.environ.get("INSIGHTLY_API_KEY", "").strip()
     if not env_key:
         return
     pod = os.environ.get("INSIGHTLY_POD", "na1").strip() or "na1"
-    name = "Extension key"
-    for n, rec in load_saved().items():
+    wanted = os.environ.get("INSIGHTLY_ENV_NAME", "").strip()
+    saved = load_saved()
+
+    # Already saved under some name? Reuse it — never duplicate the same key.
+    for n, rec in saved.items():
         if rec.get("api_key") == env_key:
-            name, pod = n, rec.get("pod", pod)
-            break
+            ACTIVE.update(key=env_key, pod=rec.get("pod", pod), name=n)
+            log(f"active environment: {n} (already saved)")
+            return
+
+    name = wanted or "demo1"
+    if name in saved and saved[name].get("api_key") != env_key:
+        # Same label, different key: keep the existing entry and disambiguate rather than
+        # silently overwriting an environment the user still relies on.
+        i = 2
+        while f"{name}-{i}" in saved:
+            i += 1
+        name = f"{name}-{i}"
+    saved[name] = {"api_key": env_key, "pod": pod}
+    try:
+        save_saved(saved)
+        log(f"saved and activated environment: {name}")
+    except Exception as e:                                     # noqa: BLE001
+        log(f"could not write the keystore ({e}) — running with the key in memory only")
     ACTIVE.update(key=env_key, pod=pod, name=name)
 
 

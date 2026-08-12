@@ -10,4 +10,9 @@ python3 -c "import ast;ast.parse(open('$HERE/server/bridge.py').read())"
 mkdir -p "$HERE/dist"
 OUT="$HERE/dist/$NAME-$VER.mcpb"
 npx -y @anthropic-ai/mcpb pack "$HERE" "$OUT"
+# Stable alias the CF artifact's download button points at — same trick as the main
+# bundle, so the link never needs editing on a release.
+ALIAS="$HERE/dist/insightly-se-mcp-bridge-latest.mcpb"
+cp "$OUT" "$ALIAS"
 echo "Built $OUT"
+echo "Alias  $ALIAS"
