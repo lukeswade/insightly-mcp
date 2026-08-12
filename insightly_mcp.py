@@ -41,7 +41,7 @@ from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one 
 
 from app_ui import ENV_DASHBOARD_HTML
 
-SERVER_VERSION = "3.7.2"
+SERVER_VERSION = "3.8.0"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -914,53 +914,106 @@ async def _search_window(o: str, since: str) -> tuple:
     return out, False                    # hit the bound; there may be more in this window
 
 
-async def _newest_records(o: str, want: int) -> tuple:
-    """The `want` most recently created-or-updated records for one object, newest first.
+_LADDER_MIN = (60, 360, 1440, 10080, 43200, 129600, 525600, 2628000)
 
-    The list endpoint cannot answer this on its own: it returns records in ascending id
-    order (oldest first) and silently ignores updated_after_utc, so asking it for page 1
-    yields the OLDEST records — which is exactly what the dashboard used to show.
-    /{Object}/Search does honour updated_after_utc, so:
 
-      * if the whole object fits in one page, fetch it and sort — an exact answer;
-      * otherwise widen a Search window until it yields enough to fill the list.
+def _minutes_ago(m: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(minutes=m)).strftime("%Y-%m-%d %H:%M:%S")
 
-    Returns (records, total_or_None, basis) where basis says how the set was derived, so
-    the caller can be honest about an answer that is a good approximation rather than a
-    guarantee.
-    """
-    body, hdrs = await _request("GET", f"/{o}", want_headers=True,
-                                params={"top": _SCAN_CAP, "skip": 0, "brief": "true",
-                                        "count_total": "true"})
-    if isinstance(body, dict) and body.get("error"):
-        return body, None, "error"
-    items = _brief_strip(body if isinstance(body, list) else [])
+
+def _ago(m: int) -> str:
+    if m < 90:
+        return f"{m}m"
+    if m < 2880:
+        return f"{round(m / 60)}h"
+    return f"{round(m / 1440)}d"
+
+
+async def _window_count(o: str, since: str) -> int:
+    """How many records changed since `since` — one record on the wire, count in the header."""
+    _, hdrs = await _request("GET", f"/{o}/Search", want_headers=True,
+                            params={"top": 1, "brief": "true", "count_total": "true",
+                                    "updated_after_utc": since})
     try:
-        total = int(hdrs.get("x-total-count"))
+        return int(hdrs.get("x-total-count"))
+    except (TypeError, ValueError):
+        return -1
+
+
+async def _newest_records(o: str, want: int) -> tuple:
+    """The `want` most recently created-or-updated records — correctly, at any object size.
+
+    Insightly cannot sort, so ranking by recency means holding the candidates in memory.
+    The trick is shrinking the candidate set until it fits one page: /{Object}/Search does
+    filter on updated_after_utc and does report a count for a single-record request, so
+    bracket a change window on a coarse ladder and then BISECT the cutoff in time until the
+    window holds between `want` and one page. Every record newer than that cutoff is inside
+    the window, so ranking the window ranks the whole object — exact, not a sample.
+
+    Two real shapes: a steady stream brackets in a couple of probes; a nightly sync that
+    stamps thousands of rows in one minute cannot be bisected below that cluster, but those
+    records genuinely tie on recency, so the documented (recency, id) order makes the
+    highest ids the answer and the window's tail is exact rather than approximate.
+    """
+    _, hdrs0 = await _request("GET", f"/{o}", want_headers=True,
+                              params={"top": 1, "brief": "true", "count_total": "true"})
+    try:
+        total = int(hdrs0.get("x-total-count"))
     except (TypeError, ValueError):
         total = None
 
-    # Everything the object has is in the page we just read: sorting it is exact.
-    if total is None or total <= len(items):
-        return _sort_newest(items, o)[:want], total, "exact"
+    async def rank(path: str, params: dict, basis: str) -> tuple:
+        body = await _request("GET", path, params=params)
+        if isinstance(body, dict) and body.get("error"):
+            return body, total, "error"
+        items = _brief_strip(body if isinstance(body, list) else [])
+        return _sort_newest(items, o)[:want], total, basis
 
-    for days in _RECENT_WINDOWS:
-        since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-        found, complete = await _search_window(o, since)
-        if found is None:
-            break                       # this object has no /Search — use the tail instead
-        if len(found) >= want:
-            basis = f"changed in the last {days}d"
-            return _sort_newest(found, o)[:want], total, (basis if complete else basis + " (capped)")
+    # Small enough to hold whole — also the fallback when no count header comes back.
+    if total is None or total <= _SCAN_CAP:
+        return await rank(f"/{o}", {"top": _SCAN_CAP, "skip": 0, "brief": "true"}, "exact")
 
-    # No /Search, or nothing recent enough to fill the list. Ascending id order puts the
-    # newest CREATED records on the last page — far closer to "newest" than page 1.
-    tail = await _request("GET", f"/{o}", params={"top": want, "skip": max(0, total - want),
-                                                  "brief": "true"})
-    if isinstance(tail, dict) and tail.get("error"):
-        return _sort_newest(items, o)[:want], total, "oldest page only"
-    tail = _brief_strip(tail if isinstance(tail, list) else [])
-    return _sort_newest(tail, o)[:want], total, "newest by id"
+    lo, lo_count, hi, hi_count = 0, 0, -1, -1
+    for m in _LADDER_MIN:
+        n = await _window_count(o, _minutes_ago(m))
+        if n < 0:
+            break
+        if n >= want:
+            hi, hi_count = m, n
+            break
+        lo, lo_count = m, n
+
+    if hi < 0:
+        why = ("newest by id (this object has no searchable change date)"
+               if hi_count < 0 and lo_count == 0
+               else "newest by id (too few recent changes to bracket a window)")
+        return await rank(f"/{o}", {"top": want, "skip": max(0, total - want),
+                                    "brief": "true"}, why)
+
+    guard = 14
+    while hi_count > _SCAN_CAP and hi - lo > 1 and guard > 0:
+        guard -= 1
+        mid = (lo + hi) // 2
+        n = await _window_count(o, _minutes_ago(mid))
+        if n < 0:
+            break
+        if n >= want:
+            hi, hi_count = mid, n
+        else:
+            lo, lo_count = mid, n
+
+    since = _minutes_ago(hi)
+    if hi_count <= _SCAN_CAP:
+        return await rank(f"/{o}/Search",
+                          {"top": _SCAN_CAP, "skip": 0, "brief": "true",
+                           "updated_after_utc": since},
+                          f"exact — ranked every record changed in the last {_ago(hi)}")
+
+    return await rank(f"/{o}/Search",
+                      {"top": _SCAN_CAP, "skip": max(0, hi_count - _SCAN_CAP),
+                       "brief": "true", "updated_after_utc": since},
+                      f"exact by tie-break — {hi_count} records share the newest change "
+                      f"time (within {_ago(hi)}), so the highest ids win")
 
 
 def _field(rec: Any, name: str) -> Any:

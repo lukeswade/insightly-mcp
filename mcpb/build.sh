@@ -70,6 +70,25 @@ if missing or phantom:
 print(f"manifest tool list matches the server ({len(model)} model-facing tools)")
 PYCHECK
 
+# Every private helper the module calls must actually exist. Editing this file by slicing
+# between two anchors can silently swallow a helper that lived between them (it ate _field
+# once), and Python only notices at call time — i.e. in front of a user.
+python3 - "$ROOT" <<'PYNAMES'
+import ast, pathlib, sys
+tree = ast.parse((pathlib.Path(sys.argv[1]) / "insightly_mcp.py").read_text())
+defined = {n.name for n in ast.walk(tree)
+           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+defined |= {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign)
+            for t in n.targets if isinstance(t, ast.Name)}
+called = {n.func.id for n in ast.walk(tree)
+          if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id.startswith("_")}
+missing = sorted(called - defined)
+if missing:
+    print(f"ERROR: these private helpers are called but never defined: {missing}", file=sys.stderr)
+    raise SystemExit(1)
+print(f"every private helper resolves ({len(called)} referenced)")
+PYNAMES
+
 # The host injects the view via document.write(); a backslash escape or backtick in the
 # document survives into a JS string it builds and produces
 # "SyntaxError: Failed to execute 'write' on 'Document'" — a blank widget. Ban both.
