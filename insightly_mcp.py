@@ -42,7 +42,7 @@ from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one 
 
 from app_ui import ENV_DASHBOARD_HTML
 
-SERVER_VERSION = "3.9.0"
+SERVER_VERSION = "3.10.0"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -1994,7 +1994,13 @@ async def get_record(object: str, record_id: int, ctx: Context) -> Any:
 @mcp.tool()
 async def create_record(object: str, fields: dict, ctx: Context) -> Any:
     """Create a record. `fields` = API field names → values, e.g.
-    create_record('Contacts', {'FIRST_NAME':'Jane','LAST_NAME':'Doe'})."""
+    create_record('Contacts', {'FIRST_NAME':'Jane','LAST_NAME':'Doe'}).
+
+    FOR TASKS, PREFER create_task. Setting OPPORTUNITY_ID / PROJECT_ID here fills the
+    "Linked Opportunity/Project" field but does NOT put the task on that record's Activity
+    tab — Insightly needs a separate Link too. create_task does both; otherwise follow this
+    call with link_records(object='Tasks', record_id=<new task>,
+    link_object_name='Opportunity'|'Project', link_object_id=<the record>)."""
     err = await _ensure(ctx)
     if err:
         return {"error": err}
@@ -2046,6 +2052,88 @@ async def delete_record(object: str, record_id: int, ctx: Context, confirm: bool
     if not confirm:
         return {"error": "destructive — pass confirm=true to actually delete this record."}
     return await _request("DELETE", f"/{_obj(object)}/{record_id}")
+
+@mcp.tool()
+async def create_task(title: str, ctx: Context, link_object: Optional[str] = None,
+                      link_ids: Optional[list] = None, due_in_days: Optional[int] = None,
+                      due_date: Optional[str] = None, details: Optional[str] = None,
+                      responsible_user_id: Optional[int] = None,
+                      priority: Optional[int] = None, status: Optional[str] = None) -> Any:
+    """Create follow-up tasks against Opportunities or Projects — and make them actually
+    appear on the record's Activity tab.
+
+    USE THIS INSTEAD OF create_record FOR TASKS. Setting OPPORTUNITY_ID / PROJECT_ID on a
+    Task fills Insightly's "Linked Opportunity/Project" field, but that alone does NOT put
+    the task on that record's Activity tab — Insightly needs a separate true Link as well.
+    This tool always does both, so a task created here is both associated and visible where
+    people look for it.
+
+    Pass link_ids to create one task per record in a single call — "a follow-up task on
+    every open opportunity" is one call, not one per deal. Give due_in_days (e.g. 7) or an
+    explicit due_date (YYYY-MM-DD)."""
+    err = await _ensure(ctx)
+    if err:
+        return {"error": err}
+    ids = [int(i) for i in (link_ids or [])][:100]
+    lo = _obj(link_object) if link_object else None
+    if ids and not lo:
+        return {"error": "link_object is required when link_ids is given "
+                         "(Opportunities or Projects)."}
+    if lo and lo not in ("Opportunities", "Projects"):
+        return {"error": f"tasks link to Opportunities or Projects, not '{lo}'.",
+                "hint": "for other objects create the task then call link_records yourself."}
+    due = due_date
+    if not due and due_in_days is not None:
+        due = (datetime.now(timezone.utc) + timedelta(days=int(due_in_days))).strftime("%Y-%m-%d")
+    id_field = "PROJECT_ID" if lo == "Projects" else "OPPORTUNITY_ID"
+    singular = "Project" if lo == "Projects" else "Opportunity"
+    base: dict = {"TITLE": title, "COMPLETED": False}
+    if due:
+        base["DUE_DATE"] = due
+    if details:
+        base["DETAILS"] = details
+    if responsible_user_id:
+        base["RESPONSIBLE_USER_ID"] = responsible_user_id
+    if priority is not None:
+        base["PRIORITY"] = priority
+    if status:
+        base["STATUS"] = status
+
+    created: list = []
+    failed: list = []
+    for rid in (ids or [None]):
+        fields = dict(base)
+        if rid is not None:
+            fields[id_field] = rid
+        task = await _request("POST", "/Tasks", json_body=fields)
+        if not isinstance(task, dict) or task.get("error"):
+            failed.append({"link_id": rid,
+                           "error": (task or {}).get("error", "create failed")})
+            continue
+        row = {"task_id": task.get("TASK_ID"), "title": task.get("TITLE"),
+               "due_date": task.get("DUE_DATE")}
+        if rid is not None:
+            row[id_field] = rid
+            link = await _request("POST", f"/Tasks/{task.get('TASK_ID')}/Links",
+                                  json_body={"LINK_OBJECT_NAME": singular,
+                                             "LINK_OBJECT_ID": rid})
+            if isinstance(link, dict) and link.get("error"):
+                row["linked"] = False
+                row["link_error"] = link["error"]
+                row["warning"] = ("the task was created and associated, but the Activity-tab "
+                                  "link failed — call link_records to finish it.")
+            else:
+                row["linked"] = True
+                row["link_id"] = (link or {}).get("LINK_ID")
+        created.append(row)
+
+    out = {"created": len(created), "failed": len(failed), "errors": failed[:10],
+           "linked_to": lo,
+           "linked_count": sum(1 for r in created if r.get("linked")),
+           "note": (f"each task carries {id_field} AND a true Link, so it shows on the "
+                    f"{singular} Activity tab") if lo else
+                   "standalone task (no record to link to)"}
+    return _fit(created, out, "tasks")
 
 @mcp.tool()
 async def add_note(parent_object: str, parent_id: int, title: str, ctx: Context, body: str = "") -> Any:

@@ -20,7 +20,7 @@ import {
 import { WIDGET_HTML } from "./widget";
 import { Metric, WhereClause, accumulate, containsAnywhere, finishGroups, matches, referencedFields } from "./query";
 
-export const SERVER_VERSION = "4.4.0-cf";
+export const SERVER_VERSION = "4.5.0-cf";
 const UI_URI = "ui://insightly/env-dashboard.html";
 const SUMMARY_OBJECTS = ["Contacts", "Organisations", "Leads", "Opportunities", "Projects",
   "Tasks", "Events", "Notes", "Emails", "Ticket", "Product", "KnowledgeArticle", "Users"];
@@ -425,7 +425,12 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
   // ------------------------------------------------------------------------- writes
   server.registerTool("create_record", {
     description: "Create a record. `fields` = API field names → values, e.g. " +
-      "create_record('Contacts', {'FIRST_NAME':'Jane','LAST_NAME':'Doe'}).",
+      "create_record('Contacts', {'FIRST_NAME':'Jane','LAST_NAME':'Doe'}).\n" +
+      "FOR TASKS, PREFER create_task. Setting OPPORTUNITY_ID / PROJECT_ID here fills the " +
+      "\"Linked Opportunity/Project\" field but does NOT put the task on that record's " +
+      "Activity tab — Insightly needs a separate Link too. create_task does both; otherwise " +
+      "follow this call with link_records(object='Tasks', record_id=<new task>, " +
+      "link_object_name='Opportunity'|'Project', link_object_id=<the record>).",
     inputSchema: z.object({ object: z.string(), fields: z.record(z.string(), z.any()) }),
   }, async (a: any) => {
     const e = ensure(); if (e) return T(e);
@@ -497,6 +502,92 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
     const e = ensure(); if (e) return T(e);
     if (!a.confirm) return T({ error: "destructive — pass confirm=true to actually delete this record." });
     return T(await ins.request("DELETE", `/${obj(a.object)}/${a.record_id}`) ?? { ok: true });
+  });
+
+  server.registerTool("create_task", {
+    description: "Create follow-up tasks against Opportunities or Projects — and make them " +
+      "actually appear on the record's Activity tab.\n" +
+      "USE THIS INSTEAD OF create_record FOR TASKS. Setting OPPORTUNITY_ID / PROJECT_ID on a " +
+      "Task fills Insightly's \"Linked Opportunity/Project\" field, but that alone does NOT " +
+      "put the task on that record's Activity tab — Insightly needs a separate true Link as " +
+      "well. This tool always does both, so a task created here is both associated and " +
+      "visible where people look for it.\n" +
+      "Pass link_ids to create one task per record in a single call — \"a follow-up task on " +
+      "every open opportunity\" is one call, not one per deal. Give due_in_days (e.g. 7) or " +
+      "an explicit due_date (YYYY-MM-DD).",
+    inputSchema: z.object({
+      title: z.string(),
+      link_object: z.string().optional(),
+      link_ids: z.array(z.number().int()).optional(),
+      due_in_days: z.number().int().optional(),
+      due_date: z.string().optional(),
+      details: z.string().optional(),
+      responsible_user_id: z.number().int().optional(),
+      priority: z.number().int().optional(),
+      status: z.string().optional(),
+    }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    const ids: number[] = (a.link_ids ?? []).slice(0, 100);
+    const lo = a.link_object ? obj(a.link_object) : null;
+    if (ids.length && !lo) {
+      return T({ error: "link_object is required when link_ids is given (Opportunities or Projects)." });
+    }
+    if (lo && !["Opportunities", "Projects"].includes(lo)) {
+      return T({ error: `tasks link to Opportunities or Projects, not '${lo}'.`,
+                 hint: "for other objects create the task then call link_records yourself." });
+    }
+    let due = a.due_date;
+    if (!due && a.due_in_days !== undefined) {
+      due = new Date(Date.now() + a.due_in_days * 864e5).toISOString().slice(0, 10);
+    }
+    const idField = lo === "Projects" ? "PROJECT_ID" : "OPPORTUNITY_ID";
+    const singular = lo === "Projects" ? "Project" : "Opportunity";
+    const baseFields: Record<string, any> = { TITLE: a.title, COMPLETED: false };
+    if (due) baseFields.DUE_DATE = due;
+    if (a.details) baseFields.DETAILS = a.details;
+    if (a.responsible_user_id) baseFields.RESPONSIBLE_USER_ID = a.responsible_user_id;
+    if (a.priority !== undefined) baseFields.PRIORITY = a.priority;
+    if (a.status) baseFields.STATUS = a.status;
+
+    const targets = ids.length ? ids : [null];
+    const created: any[] = [];
+    const failed: any[] = [];
+    // Four at a time: each target is two dependent writes, and write endpoints deserve
+    // more headroom under the per-second cap than reads do.
+    await pooled(targets.map((rid) => async () => {
+      const fields = { ...baseFields, ...(rid !== null ? { [idField]: rid } : {}) };
+      const task = await ins.request("POST", `/${"Tasks"}`, { body: fields });
+      if (!task || task.error) {
+        failed.push({ link_id: rid, error: task?.error ?? "create failed",
+                      body: String(task?.body ?? "").slice(0, 120) });
+        return;
+      }
+      const row: any = { task_id: task.TASK_ID, title: task.TITLE, due_date: task.DUE_DATE };
+      if (rid !== null) {
+        row[idField] = rid;
+        const link = await ins.request("POST", `/Tasks/${task.TASK_ID}/Links`,
+          { body: { LINK_OBJECT_NAME: singular, LINK_OBJECT_ID: rid } });
+        if (link && link.error) {
+          row.linked = false;
+          row.link_error = link.error;
+          row.warning = "the task was created and associated, but the Activity-tab link " +
+                        "failed — call link_records to finish it.";
+        } else {
+          row.linked = true;
+          row.link_id = link?.LINK_ID ?? null;
+        }
+      }
+      created.push(row);
+    }), 4);
+
+    const linked = created.filter((r) => r.linked).length;
+    return T(fit(created, {
+      created: created.length, failed: failed.length, errors: failed.slice(0, 10),
+      linked_to: lo, linked_count: linked,
+      note: lo ? `each task carries ${idField} AND a true Link, so it shows on the ` +
+                 `${singular} Activity tab` : "standalone task (no record to link to)",
+    }, "tasks"));
   });
 
   server.registerTool("add_note", {

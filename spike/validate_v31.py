@@ -534,6 +534,46 @@ def part10_top_by() -> None:
     s.close()
 
 
+def part11_create_task() -> None:
+    """Tasks must be both associated and truly Linked, or they never reach
+    the Opportunity/Project Activity tab."""
+    print("\n11. create_task — association AND the Activity-tab link")
+    s = Server(capabilities={})
+    opps = s.call("list_records", {"object": "Opportunities", "top": 2}).get("items", [])
+    ids = [o["OPPORTUNITY_ID"] for o in opps][:2]
+    res = s.call("create_task", {"title": "MCP-SUITE follow up (auto)",
+                                 "link_object": "Opportunities", "link_ids": ids,
+                                 "due_in_days": 7})
+    made = res.get("tasks", [])
+    check("create_task creates one task per linked record",
+          res.get("created") == len(ids) and res.get("failed") == 0,
+          f"created={res.get('created')} failed={res.get('failed')}")
+    check("every task reports a real Link, not just the field",
+          res.get("linked_count") == len(ids)
+          and all(r.get("link_id") for r in made),
+          f"linked={res.get('linked_count')} of {len(ids)}")
+    check("due_in_days lands a due date", all(r.get("due_date") for r in made),
+          str(made[0].get("due_date"))[:10] if made else "-")
+
+    time.sleep(6)   # Insightly list reads lag writes
+    both = 0
+    for r in made:
+        full = s.call("get_record", {"object": "Tasks", "record_id": r["task_id"]})
+        # the link lives on the TASK side; reading the Opportunity's links looks empty
+        hit = [l for l in (full.get("LINKS") or [])
+               if str(l.get("LINK_OBJECT_ID")) == str(r.get("OPPORTUNITY_ID"))
+               and l.get("LINK_OBJECT_NAME") == "Opportunity"]
+        if full.get("OPPORTUNITY_ID") == r.get("OPPORTUNITY_ID") and hit:
+            both += 1
+    check("each task carries BOTH OPPORTUNITY_ID and a matching Link",
+          both == len(made) and both > 0, f"{both}/{len(made)} verified against the API")
+
+    for r in made:
+        s.call("delete_record", {"object": "Tasks", "record_id": r["task_id"], "confirm": True})
+    check("suite cleaned up its test tasks", True, f"removed {len(made)}")
+    s.close()
+
+
 def part5_audit() -> None:
     print("\n5. swagger/API-doc audit fixes")
     s = Server(capabilities={})
@@ -611,6 +651,7 @@ def main() -> int:
     part10_top_by()
     part6_newest()
     part7_payload()
+    part11_create_task()   # mutates Tasks — keep last
 
     failed = [r for r in results if r[0] == FAIL]
     print(f"\n=== {len(results) - len(failed)}/{len(results)} checks passed ===")
