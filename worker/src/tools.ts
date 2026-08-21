@@ -25,7 +25,7 @@ import { listSnapshots, querySnapshot } from "./snapshots";
 import { tenantHash } from "./tenant";
 import { Metric, WhereClause, accumulate, containsAnywhere, finishGroups, matches, referencedFields } from "./query";
 
-export const SERVER_VERSION = "4.6.0-cf";
+export const SERVER_VERSION = "4.6.1-cf";
 const UI_URI = "ui://insightly/env-dashboard.html";
 const SUMMARY_OBJECTS = ["Contacts", "Organisations", "Leads", "Opportunities", "Projects",
   "Tasks", "Events", "Notes", "Emails", "Ticket", "Product", "KnowledgeArticle", "Users"];
@@ -819,7 +819,9 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
   // -------------------------------------------------------------- session / meta tools
   server.registerTool("connection_info", {
     description: "Show whether this connection is authenticated, which org/pod it points at, " +
-      "the server version, and the LIVE remaining daily API quota (read from a one-record probe).",
+      "the server version, the LIVE remaining daily API quota (read from a one-record probe), " +
+      "and which edge facilities are actually active for this environment — the metadata " +
+      "cache, the shared rate budget, and how many export snapshots are stored.",
     inputSchema: z.object({}),
   }, async () => {
     const out: Record<string, any> = { connected: !!s.key, as: s.envName, pod: s.pod,
@@ -830,6 +832,27 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
         out.daily_quota = { limit: ins.quota.limit, remaining: ins.quota.remaining,
                             as_of: new Date().toISOString() };
       }
+      // Two of the three edge facilities are invisible when they work — a cache hit just
+      // looks like a fast answer, and correct pacing looks like the absence of a 429. Say
+      // plainly what is on, or nobody can tell the difference between shipped and claimed.
+      const snaps = env?.EXPORTS ? await listSnapshots(env, await tenant()) : [];
+      out.edge = {
+        metadata_cache: env?.META
+          ? "on — field definitions and custom-object lists cached 1h per environment "
+            + "(describe_object reports cached:true on a hit; pass refresh:true to bypass)"
+          : "off (no KV binding)",
+        rate_budget: env?.PACER
+          ? "shared — every chat and background job on this key queues through one "
+            + "9 req/s bucket, so concurrent sessions cannot each assume the whole limit"
+          : "per-isolate only (no PACER binding)",
+        snapshots: env?.EXPORTS
+          ? { stored: snaps.length, retention: "7 days",
+              newest: snaps[0]?.snapshot_id ?? null,
+              use: "snapshot_list, then snapshot_query — export once, ask many times" }
+          : "off (no R2 binding)",
+        signed_downloads: env?.EXPORT_SIGNING_KEY ? "on — CSV links expire (60m default)"
+                                                  : "off (no signing key)",
+      };
     }
     return T(out);
   });

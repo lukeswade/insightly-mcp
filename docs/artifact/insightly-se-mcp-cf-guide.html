@@ -181,10 +181,10 @@
     instead of a re-download.</p>
 
   <div class="chips">
-    <span class="chip version">Worker 4.6.0-cf · bridge 0.4.0</span>
+    <span class="chip version">Worker 4.6.1-cf · bridge 0.4.0</span>
     <span class="chip">macOS + Windows</span>
     <span class="chip">Claude desktop app</span>
-    <span class="chip">151 automated checks</span>
+    <span class="chip">155 automated checks</span>
     <span class="chip">Demo environments</span>
   </div>
 
@@ -442,6 +442,27 @@
       </div>
     </li>
   </ol>
+
+  <h2>What the edge is doing for you</h2>
+  <p class="h2-sub">Two of these are invisible when they work — a cache hit just looks like a fast
+    answer, and correct pacing looks like the absence of an error. Ask
+    <span class="say">“run connection_info”</span> and the reply names all four.</p>
+  <div class="cards">
+    <div class="card"><b>Field definitions cached for an hour</b><span>Every new chat used to
+      re-fetch them. <code>describe_object</code> now answers a repeat in ~40ms instead of ~1.2s,
+      and says <code>cached: true</code> when it does. Pass <code>refresh: true</code> to force a
+      live read.</span></div>
+    <div class="card"><b>One rate budget per key</b><span>Two chats on the same environment — or a
+      question asked while a background export runs — used to each assume they owned Insightly's
+      whole 10 req/s. They now queue through a single bucket, which is what stops the 429s.</span></div>
+    <div class="card"><b>Exports stay queryable for 7 days</b><span>Say
+      <span class="say">“list my snapshots”</span>, then ask one anything — group it, rank it,
+      filter it — including tomorrow, in a new chat. The expensive part is done once. This is what
+      makes “top customers by tenure <i>and</i> by revenue” two cheap questions instead of two
+      exports.</span></div>
+    <div class="card"><b>Signed, expiring CSV links</b><span>Served by the Worker, valid 60 minutes
+      by default, and impossible to edit into another environment's file.</span></div>
+  </div>
 
   <h2>Worth trying</h2>
   <p class="h2-sub">These are the things the laptop build genuinely cannot do.</p>

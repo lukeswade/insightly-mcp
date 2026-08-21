@@ -858,6 +858,21 @@ def part12_hardening() -> None:
           "no snapshot" in str(miss.get("error")), str(miss.get("error"))[:60])
     s.close()
 
+    # --- the edge facilities must be VISIBLE, not just present -----------------------
+    s2 = Server(capabilities={})
+    edge = (s2.call("connection_info", {}) or {}).get("edge") or {}
+    check("connection_info names the metadata cache",
+          "on" in str(edge.get("metadata_cache"))[:4], str(edge.get("metadata_cache"))[:40])
+    check("connection_info names the shared rate budget",
+          str(edge.get("rate_budget")).startswith("shared"), str(edge.get("rate_budget"))[:40])
+    check("connection_info counts the stored snapshots",
+          isinstance(edge.get("snapshots"), dict)
+          and (edge["snapshots"].get("stored") or 0) >= 1,
+          f"stored={(edge.get('snapshots') or {}).get('stored')}")
+    check("connection_info states that downloads are signed",
+          "on" in str(edge.get("signed_downloads"))[:4], str(edge.get("signed_downloads"))[:40])
+    s2.close()
+
     # --- key custody: source assertions, since DO storage is not observable ----------
     src = open(os.path.join(os.path.dirname(HERE), "worker", "src", "tasks.ts")).read()
     check("a task that never finishes is expired by wall-clock age",
