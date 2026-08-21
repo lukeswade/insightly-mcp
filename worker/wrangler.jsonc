@@ -52,6 +52,10 @@
     {
       "binding": "EXPORTS",
       "bucket_name": "insightly-se-exports"
+    },
+    {
+      "binding": "INSTALL",
+      "bucket_name": "insightly-se-install"
     }
   ],
   "vars": {}

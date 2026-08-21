@@ -12,12 +12,14 @@ Run:
 import json
 import hashlib
 import hmac
+import io
 import os
 import pathlib
 import subprocess
 import sys
 import threading
 import time
+import zipfile
 
 import httpx
 
@@ -46,6 +48,7 @@ def _read_secret(name: str) -> str:
 # the harness supplies it the same way an operator would.
 BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "").strip() or _read_secret("bridge_secret")
 SIGNING_KEY = _read_secret("export_signing_key")
+INSTALL_TOKEN = _read_secret("install_token")
 WORKER_URL = os.environ.get("BRIDGE_URL",
                             "https://insightly-se-mcp.lukeswade.workers.dev/mcp")
 CONTACTS_TOTAL = 0        # discovered at startup; the suite used to hardcode one env's count
@@ -857,6 +860,31 @@ def part12_hardening() -> None:
     check("an unknown snapshot fails clearly instead of silently empty",
           "no snapshot" in str(miss.get("error")), str(miss.get("error"))[:60])
     s.close()
+
+    # --- the installer is token-gated, and the bundle it serves actually works -------
+    inst = f"{base}/install/insightly-se-mcp-bridge.mcpb"
+    check("the installer refuses an unauthenticated download",
+          httpx.get(inst, timeout=30).status_code == 403)
+    check("the installer refuses a wrong token",
+          httpx.get(inst, params={"t": "nope"}, timeout=30).status_code == 403)
+    if INSTALL_TOKEN:
+        got = httpx.get(inst, params={"t": INSTALL_TOKEN}, timeout=60)
+        check("the token downloads a bundle, named for the installer",
+              got.status_code == 200 and got.content[:2] == b"PK"
+              and ".mcpb" in got.headers.get("content-disposition", ""),
+              f"HTTP {got.status_code} {len(got.content)} bytes")
+        z = zipfile.ZipFile(io.BytesIO(got.content))
+        check("the served bundle carries the endpoint credential (or it 401s on install)",
+              BRIDGE_SECRET and BRIDGE_SECRET in z.read("server/_secret.py").decode(),
+              f"files={len(z.namelist())}")
+        mani = json.loads(z.read("manifest.json"))
+        req = [k for k, v in mani["user_config"].items() if v.get("required")]
+        check("install stays at two required fields — no token for the user to paste",
+              req == ["api_key", "env_name"], f"required={req}")
+    # ...and the credential-bearing bundle must never be in git.
+    tracked = subprocess.run(["git", "ls-files", "bridge/dist"], capture_output=True, text=True,
+                             cwd=os.path.dirname(HERE)).stdout.strip()
+    check("no credential-bearing bundle is tracked by git", tracked == "", tracked[:60] or "none")
 
     # --- the edge facilities must be VISIBLE, not just present -----------------------
     s2 = Server(capabilities={})

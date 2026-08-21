@@ -181,7 +181,7 @@
     instead of a re-download.</p>
 
   <div class="chips">
-    <span class="chip version">Worker 4.6.1-cf · bridge 0.4.0</span>
+    <span class="chip version">Worker 4.6.1-cf · bridge 0.4.1</span>
     <span class="chip">macOS + Windows</span>
     <span class="chip">Claude desktop app</span>
     <span class="chip">155 automated checks</span>
@@ -199,18 +199,20 @@
   <div class="banner">
     <span class="mark">!</span>
     <p><b>Already installed an earlier bridge? Download it again.</b> The Worker endpoint is now
-      closed to callers that don't present an access token, so bridge <b>0.3.x stops working</b> and
-      says so: <i>"this bridge is out of date or unauthorized."</i> Download below, double-click, let
-      it replace the existing extension, and paste the token Luke sent you into the new
-      <b>Access token</b> field. Your saved environments and keys are untouched — they live in your
-      own keystore, not in the extension.</p>
+      closed to callers that don't carry the bundle's credential, so bridge <b>0.3.x stops
+      working</b> and says so: <i>"this bridge is out of date or unauthorized."</i> Download below,
+      double-click, and let it replace the existing extension — there is no new field to fill in,
+      and your saved environments and keys are untouched, because they live in your own keystore
+      rather than in the extension.</p>
   </div>
 
   <div class="download">
-    <a class="btn" href="https://github.com/lukeswade/insightly-mcp/raw/main/bridge/dist/insightly-se-mcp-bridge-latest.mcpb">Download the CF bridge (.mcpb)</a>
-    <small>Always the current build — this link tracks the newest bridge automatically. Works on
-      <b>macOS and Windows</b>, in the <b>Claude desktop app</b> (not claude.ai in a browser).
-      Installs alongside the classic extension without disturbing it.</small>
+    <a class="btn" href="{{INSTALL_URL}}">Download the CF bridge (.mcpb)</a>
+    <small>Always the current build — this link serves whatever was released last, so it never
+      needs editing. Works on <b>macOS and Windows</b>, in the <b>Claude desktop app</b> (not
+      claude.ai in a browser), and installs alongside the classic extension without disturbing it.
+      <b>Treat the link itself as the credential:</b> it is what authorises the download, so pass it
+      on the way you would a password, not in a channel.</small>
   </div>
 
   <h2>Why move the MCP layer to a Worker</h2>
@@ -308,10 +310,9 @@
   </ul>
 
   <h2>Install — macOS</h2>
-  <p class="h2-sub">Two things to have ready: your <b>Insightly API key</b> (in any demo
-    environment, <b>profile picture, top right → User Settings → API</b>) and the <b>access token</b>
-    Luke sent you — the server refuses requests without it, which is what keeps the endpoint from
-    being usable by anyone who happens to find the URL.</p>
+  <p class="h2-sub">You'll need your Insightly API key: in any demo environment, click your
+    <b>profile picture (top right) → User Settings → API</b> and copy the key. Nothing else — the
+    credential the server requires is already inside the download.</p>
   <ol class="steps">
     <li>
       <span class="stepnum">1</span>
@@ -334,9 +335,8 @@
     <li>
       <span class="stepnum">3</span>
       <div class="stepbody">
-        <h4>Fill in the dialog (3 required fields)</h4>
+        <h4>Fill in the dialog (2 required fields)</h4>
         <p><b>Insightly API key</b> — paste the key. It is stored by Claude and written to your local keystore; it never appears in chat.</p>
-        <p><b>Access token</b> — paste the token Luke sent you. Without it every request comes back <i>“this bridge is out of date or unauthorized.”</i></p>
         <p><b>Name this environment</b> — a short label like <code>demo1</code>. This is how you'll switch later (<span class="say">“switch to demo1”</span>), and you can add more environments from the dashboard afterwards.</p>
         <p><b>Path to uv</b> — paste the path from step 1.</p>
         <p class="fine">Leave <b>pod</b> as <code>na1</code> unless your Insightly URL says otherwise, and leave the server URL alone.</p>
@@ -353,8 +353,7 @@
 
   <h2>Install — Windows</h2>
   <p class="h2-sub">Same four steps; only the uv install differs, and you can ignore the uv path
-    field entirely because Windows finds it automatically. Have the <b>access token</b> Luke sent
-    you to hand — it is a required field.</p>
+    field entirely because Windows finds it automatically.</p>
   <ol class="steps">
     <li>
       <span class="stepnum">1</span>
@@ -385,7 +384,7 @@
       <span class="stepnum">4</span>
       <div class="stepbody">
         <h4>Fill in the dialog, then restart Claude again</h4>
-        <p><b>Insightly API key</b> — paste the key. <b>Access token</b> — paste the token Luke sent you. <b>Name this environment</b> — a short label like <code>demo1</code>.</p>
+        <p><b>Insightly API key</b> — paste the key. <b>Name this environment</b> — a short label like <code>demo1</code>.</p>
         <p><b>Path to uv (macOS)</b> — ignore this one entirely. <b>Path to uv (Windows)</b> — leave it as <code>uv</code> for now; it works whenever uv is on your PATH. Leave <b>pod</b> as <code>na1</code> and the server URL as-is.</p>
         <p>Then quit from the system tray once more and reopen.</p>
       </div>
@@ -483,7 +482,7 @@
       <tr><th>Symptom</th><th>Fix</th></tr>
       <tr>
         <td>No Insightly tools at all</td>
-        <td>The extension needs all three required fields. Open <b>Settings → Extensions → Insightly SE MCP — Bridge (TEST)</b>, confirm the API key, the access token and the environment name are filled, then restart Claude fully.</td>
+        <td>The extension needs both required fields. Open <b>Settings → Extensions → Insightly SE MCP — Bridge (TEST)</b>, confirm the API key and environment name are filled, then restart Claude fully.</td>
       </tr>
       <tr>
         <td>“Server disconnected”, or the first question never returns</td>
@@ -491,7 +490,7 @@
       </tr>
       <tr>
         <td>“This bridge is out of date or unauthorized”</td>
-        <td>Either the <b>Access token</b> field is empty or wrong — check it in <b>Settings → Extensions → Insightly SE MCP — Bridge (TEST)</b> — or the installed bundle predates the closed endpoint, in which case download the current <b>.mcpb</b> from the button at the top of this page and install it over the old one. Restart Claude from the system tray (Windows) or with ⌘Q (macOS) either way.</td>
+        <td>The installed bundle predates the closed endpoint, or was built before the credential was last rotated. Download the current <b>.mcpb</b> from the button at the top of this page, install it over the old one, and restart Claude from the system tray (Windows) or with ⌘Q (macOS).</td>
       </tr>
       <tr>
         <td>Answers look inconsistent between questions</td>

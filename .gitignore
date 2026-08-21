@@ -15,3 +15,9 @@ __pycache__/
 
 # injected at build time; must never be committed (public repo)
 bridge/server/_secret.py
+
+# bundles carry the endpoint credential; they are released to R2, never committed
+bridge/dist/
+
+# rendered with the live install link; never committed
+docs/artifact/build/

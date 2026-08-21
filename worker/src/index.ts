@@ -29,7 +29,7 @@ import { buildServer, SERVER_VERSION, WorkerSession } from "./tools";
 import { taskCall, TaskDO } from "./tasks";
 import { PacerDO } from "./pacer";
 import { GateDO, gateCheck, gateFail, tooMany } from "./gate";
-import { serveDownload } from "./links";
+import { serveDownload, serveInstall } from "./links";
 import { safeEqual } from "./tenant";
 
 export { TaskDO, PacerDO, GateDO };
@@ -40,8 +40,10 @@ interface Env {
   GATE?: DurableObjectNamespace;
   META?: KVNamespace;
   EXPORTS?: R2Bucket;
+  INSTALL?: R2Bucket;
   BRIDGE_SECRET?: string;
   EXPORT_SIGNING_KEY?: string;
+  INSTALL_TOKEN?: string;
 }
 
 const OUT_OF_DATE =
@@ -113,6 +115,9 @@ export default {
         { headers: { "content-type": "text/plain" } });
     }
     if (url.pathname.startsWith("/d/")) return serveDownload(env, url);
+    // The installer itself: token-gated, because the bundle contains the endpoint
+    // credential. Deliberately BEFORE the bridge-secret gate — a browser has neither.
+    if (url.pathname.startsWith("/install")) return serveInstall(env, url);
 
     if (!env.BRIDGE_SECRET) {
       return new Response("Worker misconfigured: BRIDGE_SECRET is not set.\n", { status: 503 });

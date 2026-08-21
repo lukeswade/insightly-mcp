@@ -32,12 +32,17 @@ TIMEOUT = float(os.environ.get("BRIDGE_TIMEOUT", "120"))
 KEYS_FILE = os.path.expanduser("~/.insightly-mcp/keys.json")
 
 # The worker endpoint is public, so it requires a shared credential before it will proxy
-# anything to Insightly. It arrives the same way the API key does: as an install-time field
-# the user pastes, handed out person to person. Deliberately NOT baked into the bundle —
-# the bundle is committed to a PUBLIC repo, so anything inside it is published to the
-# world, which would defeat the point of gating the endpoint at all. Cloudflare Access in
-# front is the upgrade when the audience outgrows hand-delivered tokens.
-BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "").strip()
+# anything to Insightly. It is injected into the bundle at build time, which is why the
+# bundle is served from R2 behind a token rather than committed to this repo: the repo is
+# public, and a published bundle would be a published secret. Making the user paste the
+# token instead would be friction every tester pays forever to solve a hosting problem.
+# Cloudflare Access is the upgrade when the audience outgrows one shared credential.
+try:
+    from _secret import BRIDGE_SECRET                      # type: ignore
+except Exception:                                          # noqa: BLE001
+    BRIDGE_SECRET = ""
+# The environment wins, for tests and for a rebuild against a rotated secret.
+BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "").strip() or BRIDGE_SECRET
 
 # stdin is served by a fixed pool, not a thread per line: a host that fires a burst (the
 # dashboard widget can) used to spawn an unbounded number of threads. The bounded queue
@@ -436,9 +441,9 @@ def preflight() -> None:
     useful thing the log can tell us.
     """
     if not BRIDGE_SECRET:
-        log("WARNING: no access token configured — the server will refuse every request "
-            "with 401. Open Settings -> Extensions -> Insightly SE MCP - Bridge (TEST) and "
-            "paste the access token, then restart Claude.")
+        log("WARNING: this build carries no endpoint credential — every request will come "
+            "back 401. Download the bundle again from the install guide; a bundle built "
+            "outside bridge/build.sh will not work.")
     log(f"python {sys.version.split()[0]} on {platform.system()} {platform.release()}")
     log(f"executable: {sys.executable}")
     log(f"httpx {httpx.__version__}")

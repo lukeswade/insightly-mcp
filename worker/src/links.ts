@@ -63,3 +63,37 @@ export async function serveDownload(env: any, url: URL): Promise<Response> {
     },
   });
 }
+
+/**
+ * Serve the current bridge bundle.
+ *
+ * The bundle carries the endpoint credential, so it cannot live in the GitHub repo — that
+ * repo is public, and a published bundle is a published secret. It lives in R2 instead and
+ * is downloaded through this route, whose token is the thing the install guide protects.
+ * That keeps the credential off every public surface while leaving the install itself at
+ * two fields: an access token pasted by hand is friction paid by every tester forever, to
+ * solve a problem that is really about where the file is hosted.
+ *
+ * A plain GET with the token in the query string, because a browser download button cannot
+ * set headers. The token has its own secret (INSTALL_TOKEN) so rotating it does not
+ * invalidate outstanding CSV links.
+ */
+export async function serveInstall(env: any, url: URL): Promise<Response> {
+  const deny = (msg: string, status = 403) =>
+    new Response(msg + "\n", { status, headers: { "content-type": "text/plain" } });
+  if (!env?.INSTALL_TOKEN) return deny("Downloads are not configured on this worker.", 503);
+  if (!safeEqual(url.searchParams.get("t") ?? "", env.INSTALL_TOKEN)) {
+    return deny("This download link is not valid. Get the current one from the install guide.");
+  }
+  const obj = await env.INSTALL?.get(INSTALL_KEY);
+  if (!obj) return deny("No bundle has been published yet.", 404);
+  return new Response(obj.body, {
+    headers: {
+      "content-type": "application/octet-stream",
+      "content-disposition": 'attachment; filename="insightly-se-mcp-bridge.mcpb"',
+      "cache-control": "no-store",
+    },
+  });
+}
+
+export const INSTALL_KEY = "bridge/insightly-se-mcp-bridge-latest.mcpb";
