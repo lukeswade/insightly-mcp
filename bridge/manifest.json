@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "insightly-se-mcp-bridge-test",
   "display_name": "Insightly SE MCP \u2014 Bridge (TEST)",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "TESTING \u2014 full Insightly SE MCP served from Cloudflare Workers through a local bridge. Keys stay on this machine.",
   "long_description": "Experimental: the complete Insightly SE MCP (all 35 tools + the interactive dashboard) runs on a Cloudflare Worker; this tiny local bridge forwards each request and attaches your active environment's API key per request. Keys live ONLY in this machine's keystore (~/.insightly-mcp/keys.json \u2014 shared with the classic extension) and are never stored server-side. Environment switching/add/rename/remove run locally in the bridge. Installs ALONGSIDE the classic extension; disable one while testing the other (they expose the same tool names).",
   "author": {
@@ -36,7 +36,8 @@
         "BRIDGE_URL": "${user_config.server_url}",
         "INSIGHTLY_API_KEY": "${user_config.api_key}",
         "INSIGHTLY_POD": "${user_config.pod}",
-        "INSIGHTLY_ENV_NAME": "${user_config.env_name}"
+        "INSIGHTLY_ENV_NAME": "${user_config.env_name}",
+        "BRIDGE_SECRET": "${user_config.access_token}"
       },
       "platform_overrides": {
         "win32": {
@@ -57,6 +58,13 @@
       "type": "string",
       "title": "Insightly API key",
       "description": "Insightly \u2192 profile picture (top right) \u2192 User Settings \u2192 API. Stored securely by Claude and saved to this machine only \u2014 it is sent per request and never stored on the server.",
+      "sensitive": true,
+      "required": true
+    },
+    "access_token": {
+      "type": "string",
+      "title": "Access token",
+      "description": "The token Luke sends you. The server refuses requests without it, which is what keeps the endpoint from being usable by anyone who finds the URL. Stored securely by Claude; never leaves your machine except as a header to the server.",
       "sensitive": true,
       "required": true
     },

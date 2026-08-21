@@ -181,10 +181,10 @@
     instead of a re-download.</p>
 
   <div class="chips">
-    <span class="chip version">Worker 4.5.0-cf · bridge 0.3.1</span>
+    <span class="chip version">Worker 4.6.0-cf · bridge 0.4.0</span>
     <span class="chip">macOS + Windows</span>
     <span class="chip">Claude desktop app</span>
-    <span class="chip">104 automated checks</span>
+    <span class="chip">151 automated checks</span>
     <span class="chip">Demo environments</span>
   </div>
 
@@ -194,6 +194,16 @@
       on a personal Cloudflare account while we evaluate the architecture — treat it as a preview,
       not a supported tool, and keep pointing it at <b>demo environments only</b>. The classic
       laptop-only version is untouched and remains the one to share widely.</p>
+  </div>
+
+  <div class="banner">
+    <span class="mark">!</span>
+    <p><b>Already installed an earlier bridge? Download it again.</b> The Worker endpoint is now
+      closed to callers that don't present an access token, so bridge <b>0.3.x stops working</b> and
+      says so: <i>"this bridge is out of date or unauthorized."</i> Download below, double-click, let
+      it replace the existing extension, and paste the token Luke sent you into the new
+      <b>Access token</b> field. Your saved environments and keys are untouched — they live in your
+      own keystore, not in the extension.</p>
   </div>
 
   <div class="download">
@@ -281,16 +291,27 @@
       the job finishes.</li>
     <li><b>Environment management runs locally.</b> Adding, switching, renaming and removing
       environments all execute in the bridge on your laptop, never on the server.</li>
-    <li><b>CSV links are unguessable but public.</b> Anyone with the link can download that file for
-      about 7 days, after which it deletes itself. Fine for demo data; think before generating one
-      from anything real.</li>
-    <li class="muted">Records pass through Cloudflare in transit while a tool runs. Nothing is
-      persisted there apart from a background export's own snapshot, which expires after an hour.</li>
+    <li><b>CSV links are signed and expire.</b> Each link is valid for 60 minutes by default (24
+      hours maximum, your choice), is served by the Worker rather than a public bucket, and cannot be
+      edited to reach another environment's file or to outlive its expiry. Within that window it is
+      still a bearer link — anyone holding it can download — so treat one generated from real data
+      accordingly. Files delete themselves after 7 days.</li>
+    <li><b>The endpoint is closed.</b> The Worker refuses any request that doesn't carry the
+      credential inside the bundle, and throttles an address that keeps failing — so the URL being
+      public is not the same as the tool being open.</li>
+    <li><b>Exports are kept for 7 days as queryable snapshots.</b> Export an object once, then keep
+      asking it questions — including in a new chat tomorrow — instead of paying for the export
+      again. Say <span class="say">"list my snapshots"</span> to see what's stored.</li>
+    <li class="muted">Records pass through Cloudflare in transit while a tool runs. What is stored:
+      an export's rows (7 days), field definitions cached for an hour to keep the tool quick, and
+      nothing else. Never a key.</li>
   </ul>
 
   <h2>Install — macOS</h2>
-  <p class="h2-sub">You'll need your Insightly API key: in any demo environment, click your
-    <b>profile picture (top right) → User Settings → API</b> and copy the key.</p>
+  <p class="h2-sub">Two things to have ready: your <b>Insightly API key</b> (in any demo
+    environment, <b>profile picture, top right → User Settings → API</b>) and the <b>access token</b>
+    Luke sent you — the server refuses requests without it, which is what keeps the endpoint from
+    being usable by anyone who happens to find the URL.</p>
   <ol class="steps">
     <li>
       <span class="stepnum">1</span>
@@ -313,8 +334,9 @@
     <li>
       <span class="stepnum">3</span>
       <div class="stepbody">
-        <h4>Fill in the dialog (2 required fields)</h4>
+        <h4>Fill in the dialog (3 required fields)</h4>
         <p><b>Insightly API key</b> — paste the key. It is stored by Claude and written to your local keystore; it never appears in chat.</p>
+        <p><b>Access token</b> — paste the token Luke sent you. Without it every request comes back <i>“this bridge is out of date or unauthorized.”</i></p>
         <p><b>Name this environment</b> — a short label like <code>demo1</code>. This is how you'll switch later (<span class="say">“switch to demo1”</span>), and you can add more environments from the dashboard afterwards.</p>
         <p><b>Path to uv</b> — paste the path from step 1.</p>
         <p class="fine">Leave <b>pod</b> as <code>na1</code> unless your Insightly URL says otherwise, and leave the server URL alone.</p>
@@ -331,7 +353,8 @@
 
   <h2>Install — Windows</h2>
   <p class="h2-sub">Same four steps; only the uv install differs, and you can ignore the uv path
-    field entirely because Windows finds it automatically.</p>
+    field entirely because Windows finds it automatically. Have the <b>access token</b> Luke sent
+    you to hand — it is a required field.</p>
   <ol class="steps">
     <li>
       <span class="stepnum">1</span>
@@ -362,7 +385,7 @@
       <span class="stepnum">4</span>
       <div class="stepbody">
         <h4>Fill in the dialog, then restart Claude again</h4>
-        <p><b>Insightly API key</b> — paste the key. <b>Name this environment</b> — a short label like <code>demo1</code>.</p>
+        <p><b>Insightly API key</b> — paste the key. <b>Access token</b> — paste the token Luke sent you. <b>Name this environment</b> — a short label like <code>demo1</code>.</p>
         <p><b>Path to uv (macOS)</b> — ignore this one entirely. <b>Path to uv (Windows)</b> — leave it as <code>uv</code> for now; it works whenever uv is on your PATH. Leave <b>pod</b> as <code>na1</code> and the server URL as-is.</p>
         <p>Then quit from the system tray once more and reopen.</p>
       </div>
@@ -439,11 +462,15 @@
       <tr><th>Symptom</th><th>Fix</th></tr>
       <tr>
         <td>No Insightly tools at all</td>
-        <td>The extension needs both required fields. Open <b>Settings → Extensions → Insightly SE MCP — Bridge (TEST)</b>, confirm the API key and environment name are filled, then restart Claude fully.</td>
+        <td>The extension needs all three required fields. Open <b>Settings → Extensions → Insightly SE MCP — Bridge (TEST)</b>, confirm the API key, the access token and the environment name are filled, then restart Claude fully.</td>
       </tr>
       <tr>
         <td>“Server disconnected”, or the first question never returns</td>
         <td><b>macOS:</b> the <b>Path to uv (macOS)</b> value is wrong — run <code>which uv</code> in a <b>new</b> Terminal window and paste what it prints.<br><b>Windows</b>, in order: (1) quit Claude from the <b>system tray</b>, not just the window, and reopen — a running Claude never sees a new PATH; (2) still failing, open <b>Settings → Extensions → Insightly SE MCP — Bridge (TEST)</b> and set <b>Path to uv (Windows)</b> to the full path, normally <code>C:\Users\&lt;you&gt;\.local\bin\uv.exe</code>, then restart Claude again; (3) still failing, click <b>View Logs</b> on that extension and send Luke the last 20 lines — the bridge prints its Python version, httpx version and whether it can reach the Worker, so the log says exactly which step broke.</td>
+      </tr>
+      <tr>
+        <td>“This bridge is out of date or unauthorized”</td>
+        <td>Either the <b>Access token</b> field is empty or wrong — check it in <b>Settings → Extensions → Insightly SE MCP — Bridge (TEST)</b> — or the installed bundle predates the closed endpoint, in which case download the current <b>.mcpb</b> from the button at the top of this page and install it over the old one. Restart Claude from the system tray (Windows) or with ⌘Q (macOS) either way.</td>
       </tr>
       <tr>
         <td>Answers look inconsistent between questions</td>

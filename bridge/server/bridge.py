@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""stdio <-> Streamable-HTTP bridge, v0.2: the KEY CUSTODIAN.
+"""stdio <-> Streamable-HTTP bridge, v0.4: the KEY CUSTODIAN.
 
 Claude Desktop launches this as a .mcpb extension and speaks MCP over stdio. Two jobs:
 
@@ -20,6 +20,7 @@ import json
 import os
 import pathlib
 import platform
+import queue
 import sys
 import threading
 
@@ -30,6 +31,20 @@ URL = os.environ.get("BRIDGE_URL", "").strip() or DEFAULT_URL
 TIMEOUT = float(os.environ.get("BRIDGE_TIMEOUT", "120"))
 KEYS_FILE = os.path.expanduser("~/.insightly-mcp/keys.json")
 
+# The worker endpoint is public, so it requires a shared credential before it will proxy
+# anything to Insightly. It arrives the same way the API key does: as an install-time field
+# the user pastes, handed out person to person. Deliberately NOT baked into the bundle —
+# the bundle is committed to a PUBLIC repo, so anything inside it is published to the
+# world, which would defeat the point of gating the endpoint at all. Cloudflare Access in
+# front is the upgrade when the audience outgrows hand-delivered tokens.
+BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "").strip()
+
+# stdin is served by a fixed pool, not a thread per line: a host that fires a burst (the
+# dashboard widget can) used to spawn an unbounded number of threads. The bounded queue
+# applies backpressure instead — slower under a flood, never unbounded.
+RELAY_WORKERS = 12
+_inbox: "queue.Queue[str]" = queue.Queue(maxsize=512)
+
 _stdout_lock = threading.Lock()
 _state_lock = threading.Lock()
 _state = {"session": None, "proto": None}
@@ -37,6 +52,10 @@ _client = httpx.Client(timeout=TIMEOUT)
 
 # ------------------------------------------------------------------ local keystore
 ACTIVE = {"key": None, "pod": "na1", "name": None}
+
+
+class Fatal(RuntimeError):
+    """An upstream refusal that a retry cannot fix (auth, throttling, bad request)."""
 
 
 def log(msg: str) -> None:
@@ -108,22 +127,39 @@ def boot_session() -> None:
 # ------------------------------------------------------------- local tool handlers
 def _verify_key(api_key: str, pod: str) -> dict:
     """Ask the WORKER (with the candidate key) whether Insightly accepts it — the
-    verification logic stays central; the key makes one round trip and is not kept."""
+    verification logic stays central; the key makes one round trip and is not kept.
+
+    Fails CLOSED. This used to read the answer out of `result` with defaults all the way
+    down, so any response that wasn't a successful tool call — a JSON-RPC error, a 401 from
+    the endpoint, an SSE frame it couldn't parse — produced an empty dict, no `error` key,
+    and a verdict of "the key works". A bad key then got written to the keystore. A key is
+    good only when Insightly actually answers.
+    """
     try:
         r = _client.post(URL, content=json.dumps({
             "jsonrpc": "2.0", "id": "verify", "method": "tools/call",
             "params": {"name": "raw_request",
                        "arguments": {"method": "GET", "path": "/Instance"}}}),
-            headers={"Content-Type": "application/json",
-                     "Accept": "application/json, text/event-stream",
-                     "Mcp-Method": "tools/call", "Mcp-Name": "raw_request",
+            headers={**_headers("tools/call", "raw_request"),
                      "X-Insightly-Key": api_key, "X-Insightly-Pod": pod})
-        body = _parse_single(r)
-        txt = (body or {}).get("result", {}).get("content", [{}])[0].get("text", "{}")
-        info = json.loads(txt)
-        bad = isinstance(info, dict) and info.get("error")
-        return {"ok": not bad, "info": info} if not bad else {"ok": False, "error": str(info)[:200]}
-    except Exception as e:
+        if r.status_code >= 400:
+            return {"ok": False, "error": f"the server refused the check: HTTP "
+                                          f"{r.status_code} {r.text[:120]}"}
+        body = _parse_single(r) or {}
+        if body.get("error"):
+            return {"ok": False, "error": str(body["error"])[:200]}
+        content = ((body.get("result") or {}).get("content") or [])
+        if not content or not content[0].get("text"):
+            return {"ok": False, "error": "no answer from the verification call — "
+                                          "nothing was saved."}
+        info = json.loads(content[0]["text"])
+        if not isinstance(info, dict) or info.get("error"):
+            return {"ok": False, "error": str(info)[:200]}
+        # A real /Instance answer names the instance. Anything else is not a working key.
+        if not info.get("INSTANCE_NAME") and not info.get("INSTANCE_SUBDOMAIN"):
+            return {"ok": False, "error": f"unexpected answer from Insightly: {str(info)[:120]}"}
+        return {"ok": True, "info": info}
+    except Exception as e:                                     # noqa: BLE001
         return {"ok": False, "error": str(e)[:200]}
 
 
@@ -246,6 +282,8 @@ def _headers(method: str = "", name: str = "") -> dict:
             h["Mcp-Session-Id"] = _state["session"]
         if _state["proto"]:
             h["MCP-Protocol-Version"] = _state["proto"]
+    if BRIDGE_SECRET:
+        h["X-Bridge-Auth"] = BRIDGE_SECRET
     if ACTIVE["key"]:
         h["X-Insightly-Key"] = ACTIVE["key"]
         h["X-Insightly-Pod"] = ACTIVE["pod"]
@@ -309,6 +347,13 @@ def relay(line: str) -> None:
                         _state["session"] = sid
                 if r.status_code >= 400:
                     body = r.read().decode(errors="replace")[:200]
+                    if r.status_code == 401:
+                        raise Fatal("this bridge is out of date or unauthorized — reinstall "
+                                    "the current Insightly SE MCP (Cloudflare) bundle")
+                    if r.status_code == 429:
+                        raise Fatal(f"the server is throttling this machine: {body}")
+                    if 400 <= r.status_code < 500:
+                        raise Fatal(f"HTTP {r.status_code}: {body}")
                     raise RuntimeError(f"HTTP {r.status_code}: {body}")
                 ctype = r.headers.get("content-type", "")
                 if "text/event-stream" in ctype:
@@ -326,6 +371,12 @@ def relay(line: str) -> None:
                     body = r.read()
                     if body.strip():
                         _deliver(json.loads(body), mid)
+            return
+        except Fatal as e:
+            log(f"upstream refused: {e}")
+            if mid is not None:
+                emit({"jsonrpc": "2.0", "id": mid,
+                      "error": {"code": -32001, "message": f"bridge: {e}"}})
             return
         except Exception as e:                                 # noqa: BLE001
             if attempt == 1:
@@ -384,6 +435,10 @@ def preflight() -> None:
     (uv missing from PATH, or uv could not provision a Python) — which is itself the most
     useful thing the log can tell us.
     """
+    if not BRIDGE_SECRET:
+        log("WARNING: no access token configured — the server will refuse every request "
+            "with 401. Open Settings -> Extensions -> Insightly SE MCP - Bridge (TEST) and "
+            "paste the access token, then restart Claude.")
     log(f"python {sys.version.split()[0]} on {platform.system()} {platform.release()}")
     log(f"executable: {sys.executable}")
     log(f"httpx {httpx.__version__}")
@@ -396,15 +451,30 @@ def preflight() -> None:
         log(f"WORKER UNREACHABLE: {e} — check network/proxy access to *.workers.dev")
 
 
+def _relay_worker() -> None:
+    """One pool thread: take a line, relay it, never die on a single bad message."""
+    while True:
+        line = _inbox.get()
+        try:
+            relay(line)
+        except Exception as e:                                 # noqa: BLE001
+            log(f"relay crashed: {e}")
+        finally:
+            _inbox.task_done()
+
+
 def main() -> None:
     preflight()
     boot_session()
     threading.Thread(target=schema_watchdog, daemon=True).start()
-    log(f"bridging stdio <-> {URL} (active env: {ACTIVE['name'] or 'none'})")
+    for _ in range(RELAY_WORKERS):
+        threading.Thread(target=_relay_worker, daemon=True).start()
+    log(f"bridging stdio <-> {URL} (active env: {ACTIVE['name'] or 'none'}, "
+        f"{RELAY_WORKERS} relay threads)")
     for line in sys.stdin:
         line = line.strip()
         if line:
-            threading.Thread(target=relay, args=(line,), daemon=True).start()
+            _inbox.put(line)
     log("stdin closed — exiting")
 
 

@@ -10,6 +10,7 @@
  */
 
 import { getField } from "./query";
+import { Pacer } from "./pacer";
 
 // ------------------------------------------------------------------ constants (ported)
 export const PAGE_MAX = 500;
@@ -21,6 +22,7 @@ export const RESULT_BUDGET = 900_000;
 export const RECENT_WINDOWS = [1, 7, 30, 90, 365, 1825];
 const CONCURRENCY = 6;                 // Workers cap simultaneous outbound connections
 const RATE_PER_SEC = 9;                // rolling-window budget < Insightly's 10 req/s per key
+const RESERVE_BATCH = 6;               // slots bought per PacerDO round trip
 
 export const PK: Record<string, string> = {
   Contacts: "CONTACT_ID", Organisations: "ORGANISATION_ID", Leads: "LEAD_ID",
@@ -69,6 +71,9 @@ const FORWARD_DATED = ["FORECAST", "DUE", "TARGET", "START", "END", "EXPIR", "RE
 
 // ------------------------------------------------------------------------ request layer
 export interface Session { key: string | null; pod: string; }
+
+/** Out-of-band notifications for the request layer (abuse counting, telemetry). */
+export interface Hooks { onAuthFail?: () => void; }
 export interface Quota { limit: number | null; remaining: number | null; }
 
 export class NoKeyError extends Error {}
@@ -79,8 +84,10 @@ export class Insightly {
   private starts: number[] = [];
   private inFlight = 0;
   private waiters: Array<() => void> = [];
+  /** Slots already bought from the global pacer and not yet spent. */
+  private credits = 0;
 
-  constructor(public session: Session) {}
+  constructor(public session: Session, private pacer?: Pacer, private hooks?: Hooks) {}
 
   private base(): string {
     return `https://api.${this.session.pod || "na1"}.insightly.com/v3.1`;
@@ -100,6 +107,7 @@ export class Insightly {
       await new Promise<void>((res) => this.waiters.push(res));
     }
     this.inFlight++;
+    await this.globalSlot();
     for (;;) {
       const now = Date.now();
       this.starts = this.starts.filter((t) => now - t < 1000);
@@ -107,6 +115,20 @@ export class Insightly {
       const wait = 1000 - (now - this.starts[0]) + 5;
       await new Promise((r) => setTimeout(r, wait));
     }
+  }
+
+  /**
+   * Reserve capacity from the ONE bucket for this key (PacerDO), not just from this
+   * isolate. Slots are bought RESERVE_BATCH at a time so the round trip is amortised over
+   * a whole wave of pages rather than paid per request. If the pacer is absent or errors,
+   * this is a no-op and local pacing stands — a pacing outage must never fail an answer.
+   */
+  private async globalSlot(): Promise<void> {
+    if (!this.pacer) return;
+    if (this.credits > 0) { this.credits--; return; }
+    const wait = await this.pacer.reserve(RESERVE_BATCH);
+    this.credits = RESERVE_BATCH - 1;
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
   }
 
   private release(): void {
@@ -140,6 +162,9 @@ export class Insightly {
       } finally {
         this.release();
       }
+      // 401 means the key itself was rejected. Reported so repeated rejections from one
+      // address can be throttled; 403 (valid key, no permission) is NOT an auth failure.
+      if (r.status === 401) this.hooks?.onAuthFail?.();
       const lim = r.headers.get("X-RateLimit-Limit"), rem = r.headers.get("X-RateLimit-Remaining");
       if (lim !== null) this.quota.limit = parseInt(lim, 10);
       if (rem !== null) this.quota.remaining = parseInt(rem, 10);

@@ -16,6 +16,14 @@
       {
         "name": "TASKS",
         "class_name": "TaskDO"
+      },
+      {
+        "name": "PACER",
+        "class_name": "PacerDO"
+      },
+      {
+        "name": "GATE",
+        "class_name": "GateDO"
       }
     ]
   },
@@ -25,6 +33,19 @@
       "new_sqlite_classes": [
         "TaskDO"
       ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "PacerDO",
+        "GateDO"
+      ]
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "META",
+      "id": "612e5ea1de6f41f488e0f54fa3e08551"
     }
   ],
   "r2_buckets": [
@@ -33,7 +54,5 @@
       "bucket_name": "insightly-se-exports"
     }
   ],
-  "vars": {
-    "EXPORTS_PUBLIC_BASE": "https://pub-a1985eb80495467ead59f2ff3f21003a.r2.dev"
-  }
+  "vars": {}
 }

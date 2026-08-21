@@ -12,3 +12,6 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# injected at build time; must never be committed (public repo)
+bridge/server/_secret.py

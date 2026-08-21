@@ -18,9 +18,14 @@ import {
   sortNewestBasis,
 } from "./insightly";
 import { WIDGET_HTML } from "./widget";
+import { cached } from "./cache";
+import { DEFAULT_TTL_MIN, MAX_TTL_MIN, signedUrl } from "./links";
+import { makePacer } from "./pacer";
+import { listSnapshots, querySnapshot } from "./snapshots";
+import { tenantHash } from "./tenant";
 import { Metric, WhereClause, accumulate, containsAnywhere, finishGroups, matches, referencedFields } from "./query";
 
-export const SERVER_VERSION = "4.5.0-cf";
+export const SERVER_VERSION = "4.6.0-cf";
 const UI_URI = "ui://insightly/env-dashboard.html";
 const SUMMARY_OBJECTS = ["Contacts", "Organisations", "Leads", "Opportunities", "Projects",
   "Tasks", "Events", "Notes", "Emails", "Ticket", "Product", "KnowledgeArticle", "Users"];
@@ -51,29 +56,97 @@ function writeHint(res: any, o: string): any {
   return res;
 }
 
-async function describe(ins: Insightly, o: string): Promise<Record<string, any>> {
+const DESCRIBE_SAMPLE = 5;
+
+/**
+ * Field reference for an object, and an explicit statement of what it rests on.
+ *
+ * Standard fields are not published by any Insightly metadata endpoint, so they can only
+ * be read off actual records. This used to infer them from ONE record — which is exactly
+ * the failure mode we flag in other people's tools: if the API ever omitted null-valued
+ * fields, the list would be silently short. Verified today (2026-08: every record of an
+ * object returns an identical key set, nulls included), but verified is not guaranteed, so
+ * now it takes the UNION of a sample from both ends of the object, reports how many
+ * records that was, and names any field that appeared in some records but not all.
+ * Custom fields come from /CustomFields/{object}, which IS authoritative.
+ */
+async function describeLive(ins: Insightly, o: string): Promise<Record<string, any>> {
   const out: Record<string, any> = { object: o, pk: PK[o] ?? null };
-  const [sample, cfs] = await Promise.all([
-    ins.request("GET", `/${o}`, { params: { top: 1, brief: "false" } }),
+  const [head, cfs] = await Promise.all([
+    ins.request("GET", `/${o}`, { params: { top: DESCRIBE_SAMPLE, brief: "false",
+                                            count_total: "true" }, wantHeaders: true }),
     ins.request("GET", `/CustomFields/${o}`),
   ]);
-  if (Array.isArray(sample) && sample.length && typeof sample[0] === "object") {
-    out.standard_fields = Object.keys(sample[0]).filter((k) => k !== "CUSTOMFIELDS" && k !== "ETag");
-  } else if (sample && sample.error) {
-    out.standard_fields_error = sample.error;
-  } else {
-    out.standard_fields = [];
-    out.note = "no records yet — standard fields unavailable from a sample.";
+  const [body, hdrs] = head as [any, Record<string, string>];
+  let sample: any[] = Array.isArray(body) ? body.filter((r) => r && typeof r === "object") : [];
+  const total = parseInt(hdrs?.["x-total-count"] ?? "", 10);
+  const oldest = sample.length;
+  let newest = 0;
+  if (!Number.isNaN(total) && total > DESCRIBE_SAMPLE) {
+    // The newest end too: a field added by an admin last week can only show up there.
+    const tail = await ins.request("GET", `/${o}`, {
+      params: { top: DESCRIBE_SAMPLE, skip: Math.max(total - DESCRIBE_SAMPLE, 0), brief: "false" } });
+    if (Array.isArray(tail)) {
+      const rows = tail.filter((r) => r && typeof r === "object");
+      newest = rows.length;
+      sample = sample.concat(rows);
+    }
   }
-  out.custom_fields = Array.isArray(cfs) ? cfs.filter((f) => f && typeof f === "object").map((f) => {
-    const c: Record<string, any> = { name: f.FIELD_NAME, label: f.FIELD_LABEL,
-                                     type: f.FIELD_TYPE, editable: f.EDITABLE };
-    const opts = (f.CUSTOM_FIELD_OPTIONS ?? []).map((op: any) => op?.OPTION_VALUE).filter(Boolean);
-    if (opts.length) c.options = opts;
-    if (f.JOIN_OBJECT) c.links_to = f.JOIN_OBJECT;
-    return c;
-  }) : [];
+
+  if (body && !Array.isArray(body) && body.error) {
+    out.standard_fields_error = body.error;
+    out.basis = "standard fields unavailable — the record read failed";
+  } else if (!sample.length) {
+    out.standard_fields = [];
+    out.basis = "no records yet — standard fields cannot be read from data";
+    out.note = "create one record, or consult Insightly's API docs, for the standard field list.";
+  } else {
+    const seen = new Map<string, number>();
+    for (const rec of sample) {
+      for (const k of Object.keys(rec)) {
+        if (k === "CUSTOMFIELDS" || k === "ETag") continue;
+        seen.set(k, (seen.get(k) ?? 0) + 1);          // insertion order = API order
+      }
+    }
+    out.standard_fields = [...seen.keys()];
+    const partial = [...seen.entries()].filter(([, n]) => n < sample.length).map(([k]) => k);
+    out.basis = `union of ${sample.length} records (${oldest} oldest + ${newest} newest` +
+      `${Number.isNaN(total) ? "" : ` of ${total}`}) — Insightly publishes no standard-field metadata`;
+    out.sampled = sample.length;
+    if (!Number.isNaN(total)) out.total_records = total;
+    if (partial.length) {
+      out.fields_partial = partial;
+      out.warning = "these fields were absent from some sampled records, so this object's " +
+        "field set varies by record and standard_fields may still be incomplete — " +
+        "confirm against a record you care about before relying on it.";
+    }
+  }
+
+  if (Array.isArray(cfs)) {
+    out.custom_fields = cfs.filter((f) => f && typeof f === "object").map((f) => {
+      const c: Record<string, any> = { name: f.FIELD_NAME, label: f.FIELD_LABEL,
+                                       type: f.FIELD_TYPE, editable: f.EDITABLE };
+      const opts = (f.CUSTOM_FIELD_OPTIONS ?? []).map((op: any) => op?.OPTION_VALUE).filter(Boolean);
+      if (opts.length) c.options = opts;
+      if (f.JOIN_OBJECT) c.links_to = f.JOIN_OBJECT;
+      return c;
+    });
+    out.custom_fields_basis = `/CustomFields/${o} (authoritative)`;
+  } else {
+    out.custom_fields = [];
+    if (cfs && cfs.error) out.custom_fields_error = cfs.error;
+  }
   return out;
+}
+
+/** Cached describe: field definitions are configuration, so an hour of KV is safe. */
+async function describe(ins: Insightly, o: string, env?: any,
+                        tenant?: () => Promise<string>, refresh = false):
+    Promise<Record<string, any>> {
+  if (!env?.META || !tenant) return describeLive(ins, o);
+  const { value, hit } = await cached(env, await tenant(), `desc:${o}`, refresh,
+                                     () => describeLive(ins, o));
+  return hit ? { ...(value as any), cached: true } : (value as any);
 }
 
 async function snapshot(ins: Insightly, s: WorkerSession): Promise<Record<string, any>> {
@@ -98,17 +171,36 @@ async function snapshot(ins: Insightly, s: WorkerSession): Promise<Record<string
   return out;
 }
 
+export interface BuildOpts {
+  /** Called when Insightly rejects the key (401) — feeds per-IP failure throttling. */
+  onAuthFail?: () => void;
+  /** This worker's own origin, for signing download links. */
+  origin?: string;
+}
+
 export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
-    (env: any, sess: { key: string; pod: string }, payload: Record<string, unknown>) => Promise<any>): McpServer {
+    (env: any, sess: { key: string; pod: string }, payload: Record<string, unknown>) => Promise<any>,
+    opts: BuildOpts = {}): McpServer {
   const server = new McpServer({ name: "insightly-se-mcp", version: SERVER_VERSION }, {
     // 2026-era cache hints: 5 minutes, not an hour — this server iterates fast, and a
     // long hint is exactly how clients end up reasoning against last week's tool list.
     // field metadata differs per env key, so the resource template hints private below.
     cacheHints: { "tools/list": { ttlMs: 300_000, cacheScope: "public" } },
   } as any);
-  const ins = new Insightly({ key: s.key, pod: s.pod });
+  // One tenant hash per request, computed at most once, and never the key itself.
+  let tenantP: Promise<string> | null = null;
+  const tenant = () => (tenantP ??= tenantHash({ key: s.key, pod: s.pod }));
+  const ins = new Insightly({ key: s.key, pod: s.pod }, makePacer(env, tenant),
+                            { onAuthFail: opts.onAuthFail });
   const ensure = () => (s.key ? null : NOT_CONNECTED);
   const sess = () => ({ key: s.key as string, pod: s.pod });
+  /** Custom-object definitions change when an admin changes them: cache for an hour.
+   *  The dashboard asks for these on every render. */
+  const customObjects = async (): Promise<any> => {
+    const live = () => ins.request("GET", "/CustomObjects", { params: { top: 200 } });
+    if (!env?.META) return live();
+    return (await cached(env, await tenant(), "p:/CustomObjects?top=200", false, live)).value;
+  };
 
   // ------------------------------------------------------------------------ resources
   server.registerResource("Insightly environment dashboard", UI_URI, {
@@ -167,10 +259,10 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
   server.registerTool("describe_object", {
     description: "Field reference for an object: standard + custom fields with types, labels " +
       "and valid dropdown options. Use before creating/updating records so values are valid.",
-    inputSchema: z.object({ object: z.string() }),
-  }, async ({ object }: any) => {
+    inputSchema: z.object({ object: z.string(), refresh: z.boolean().optional() }),
+  }, async ({ object, refresh }: any) => {
     const e = ensure(); if (e) return T(e);
-    return T(await describe(ins, obj(object)));
+    return T(await describe(ins, obj(object), env, tenant, !!refresh));
   });
 
   // ------------------------------------------------------------------------- reads
@@ -895,26 +987,76 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
     }),
   }, async (a: any) => {
     const e = ensure(); if (e) return T(e);
-    return T(await taskCall(env, sess(), { op: "query", task_id: a.task_id, where: a.where,
+    const r = await taskCall(env, sess(), { op: "query", task_id: a.task_id, where: a.where,
       order_by: a.order_by, group_by: a.group_by, metrics: a.metrics, fields: a.fields,
-      top: a.top }));
+      top: a.top });
+    // The live task expires after an hour, the snapshot lasts a week — so an id that
+    // worked this morning keeps working this evening instead of erroring.
+    if (r?.expired && env?.EXPORTS) {
+      const snap = await querySnapshot(env, await tenant(), String(a.task_id), a);
+      if (snap) return T({ ...snap, note: "answered from the 7-day snapshot — the live task expired." });
+    }
+    return T(r);
   });
 
   server.registerTool("export_csv", {
     description: "Turn a completed export task into a downloadable CSV file and return the " +
       "link — the deliverable escapes the chat's size ceiling entirely. Columns are the union " +
-      "of standard fields plus flattened custom fields. The link is unguessable and the file " +
-      "auto-deletes after ~7 days. CAUTION: anyone with the link can download it — treat links " +
-      "from real-data environments accordingly.",
-    inputSchema: z.object({ task_id: z.string() }),
+      "of standard fields plus flattened custom fields. The link is SIGNED and EXPIRES " +
+      "(default 60 minutes, max 24 hours); anyone holding it can download until it expires, " +
+      "so treat links from real-data environments accordingly. Files are deleted after 7 days.",
+    inputSchema: z.object({ task_id: z.string(), ttl_minutes: z.number().int().optional() }),
   }, async (a: any) => {
     const e = ensure(); if (e) return T(e);
+    const secret = env?.EXPORT_SIGNING_KEY;
+    if (!secret || !opts.origin) {
+      return T({ error: "downloads are not configured on this worker (no signing key).",
+                 hint: "task_result still returns the rows page by page." });
+    }
     const r = await taskCall(env, sess(), { op: "csv", task_id: a.task_id });
     if (r.error) return T(r);
-    const base = (env?.EXPORTS_PUBLIC_BASE ?? "").replace(/\/$/, "");
-    return T({ url: `${base}/${r.key}`, rows: r.rows, columns: r.columns, bytes: r.bytes,
-               expires: "~7 days (bucket lifecycle)",
-               note: "unguessable link, but public to anyone who has it." });
+    const link = await signedUrl(secret, opts.origin, r.key,
+                                 a.ttl_minutes ?? DEFAULT_TTL_MIN);
+    return T({ url: link.url, expires_at: link.expires_at, ttl_minutes: link.ttl_minutes,
+               rows: r.rows, columns: r.columns, bytes: r.bytes,
+               note: `signed link, valid for ${link.ttl_minutes} minutes, then dead. ` +
+                     `Re-issue with export_csv. Max ttl_minutes ${MAX_TTL_MIN}.` });
+  });
+
+  server.registerTool("snapshot_list", {
+    description: "Every stored export snapshot for this environment, newest first. A " +
+      "completed export is kept for 7 DAYS as a queryable snapshot (the live task itself " +
+      "expires after an hour), so yesterday's expensive export can answer today's question " +
+      "in a new chat — no re-export. Use snapshot_query with the snapshot_id.",
+    inputSchema: z.object({}),
+  }, async () => {
+    const e = ensure(); if (e) return T(e);
+    if (!env?.EXPORTS) return T({ error: "no snapshot store bound to this worker." });
+    const snaps = await listSnapshots(env, await tenant());
+    return T(fit(snaps, { count: snaps.length,
+      note: snaps.length ? undefined : "no snapshots yet — run start_export first." }));
+  });
+
+  server.registerTool("snapshot_query", {
+    description: "Ask a stored snapshot anything: filter, sort, group, aggregate, project — " +
+      "the same query surface as task_query, but against a snapshot that survives for 7 days " +
+      "and streams from storage, so repeat questions cost nothing extra. This is how to do " +
+      "'top customers by tenure AND by revenue' properly: export once, then ask twice.\n" +
+      WHERE_DOC,
+    inputSchema: z.object({
+      snapshot_id: z.string(), where: whereSchema, order_by: z.string().optional(),
+      group_by: z.string().optional(), metrics: metricsSchema,
+      fields: z.array(z.string()).optional(), top: z.number().int().optional(),
+    }),
+  }, async (a: any) => {
+    const e = ensure(); if (e) return T(e);
+    if (!env?.EXPORTS) return T({ error: "no snapshot store bound to this worker." });
+    const r = await querySnapshot(env, await tenant(), String(a.snapshot_id), a);
+    if (!r) {
+      return T({ error: `no snapshot '${a.snapshot_id}' — snapshots are kept 7 days.`,
+                 hint: "list what exists with snapshot_list, or re-run start_export." });
+    }
+    return T(r);
   });
 
   server.registerTool("search_everywhere", {
@@ -935,7 +1077,7 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
     let objects: string[];
     if (a.objects?.length) objects = a.objects.map(obj);
     else {
-      const defs = await ins.request("GET", "/CustomObjects", { params: { top: 200 } });
+      const defs = await customObjects();
       const custom = (Array.isArray(defs) ? defs : []).map((d: any) => d?.OBJECT_NAME).filter(Boolean);
       objects = [...SUMMARY_OBJECTS.filter((o) => o !== "Users"), ...custom];
     }
@@ -1069,7 +1211,7 @@ export function buildServer(s: WorkerSession, era: string, env: any, taskCall:
     _meta: uiMeta(["app"]),
   }, async (a: any) => {
     const e = ensure(); if (e) return T(e);
-    const defs = await ins.request("GET", "/CustomObjects", { params: { top: 200 } });
+    const defs = await customObjects();
     if (defs && !Array.isArray(defs) && defs.error) return T(defs);
     const rows = (Array.isArray(defs) ? defs : []).filter((d) => d && typeof d === "object");
     const counts = (a.with_counts ?? true)

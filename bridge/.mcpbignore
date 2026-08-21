@@ -1,3 +1,6 @@
 dist/
 build.sh
 .mcpbignore
+__pycache__/
+*.pyc
+_secret.py

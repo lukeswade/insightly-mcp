@@ -574,6 +574,40 @@ def part11_create_task() -> None:
     s.close()
 
 
+
+def part13_describe_basis() -> None:
+    """describe_object must not infer a field list from one record and stay quiet about it.
+    Blocker-tier findings against other tools have been exactly this: a silently
+    incomplete field list."""
+    print("\n13. describe_object states its basis")
+    s = Server(capabilities={})
+    d = s.call("describe_object", {"object": "Contacts"})
+    check("the field list says what it rests on", "union of" in str(d.get("basis")),
+          str(d.get("basis"))[:80])
+    check("more than one record was sampled", (d.get("sampled") or 0) >= 2,
+          f"sampled={d.get('sampled')}")
+    check("both ends of the object were sampled", "oldest +" in str(d.get("basis")),
+          str(d.get("basis"))[:50])
+    check("no field varies across sampled records (fixed key set, verified 2026-08)",
+          not d.get("fields_partial"), str(d.get("fields_partial") or "consistent")[:60])
+    check("custom fields come from the authoritative endpoint",
+          "/CustomFields/" in str(d.get("custom_fields_basis")),
+          str(d.get("custom_fields_basis")))
+    empty = s.call("describe_object", {"object": "KnowledgeArticle"})
+    check("an object with no records says so instead of returning a bare []",
+          bool(empty.get("basis")) or bool(empty.get("standard_fields")),
+          str(empty.get("basis") or f"{len(empty.get('standard_fields') or [])} fields")[:70])
+    s.close()
+
+    # The two editions are behavioural ports; drift must be a failing build, not a surprise.
+    import subprocess
+    r = subprocess.run([sys.executable,
+                        os.path.join(os.path.dirname(HERE), "tools", "check_parity.py")],
+                       capture_output=True, text=True)
+    check("the worker covers every classic tool, extras all declared",
+          r.returncode == 0, (r.stdout.strip().splitlines() or [""])[-1][:90])
+
+
 def part5_audit() -> None:
     print("\n5. swagger/API-doc audit fixes")
     s = Server(capabilities={})
@@ -651,6 +685,7 @@ def main() -> int:
     part10_top_by()
     part6_newest()
     part7_payload()
+    part13_describe_basis()
     part11_create_task()   # mutates Tasks — keep last
 
     failed = [r for r in results if r[0] == FAIL]

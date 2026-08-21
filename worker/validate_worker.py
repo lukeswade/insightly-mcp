@@ -10,12 +10,16 @@ Run:
     uv run --with 'mcp==2.0.0' --with 'httpx<1' --with 'pydantic<3' python spike/validate_v31.py
 """
 import json
+import hashlib
+import hmac
 import os
 import pathlib
 import subprocess
 import sys
 import threading
 import time
+
+import httpx
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER = os.path.join(os.path.dirname(HERE), "insightly_mcp.py")
@@ -27,6 +31,23 @@ results: list[tuple[str, str, str]] = []
 # pv2 is the designated test environment — never point this harness at a shared demo env.
 _STORE = json.load(open(os.path.expanduser("~/.insightly-mcp/keys.json")))
 TEST_ENV = "pv2" if "pv2" in _STORE else sorted(_STORE)[0]
+
+
+def _read_secret(name: str) -> str:
+    """Operator-local secrets, kept outside the repo (it is public)."""
+    try:
+        with open(os.path.expanduser(f"~/.insightly-mcp/{name}")) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+# The packed bundle carries the bridge credential inside it; the working tree does not, so
+# the harness supplies it the same way an operator would.
+BRIDGE_SECRET = os.environ.get("BRIDGE_SECRET", "").strip() or _read_secret("bridge_secret")
+SIGNING_KEY = _read_secret("export_signing_key")
+WORKER_URL = os.environ.get("BRIDGE_URL",
+                            "https://insightly-se-mcp.lukeswade.workers.dev/mcp")
 CONTACTS_TOTAL = 0        # discovered at startup; the suite used to hardcode one env's count
 
 
@@ -42,6 +63,10 @@ class Server:
         env = {"HOME": os.path.expanduser("~"), "PATH": "/usr/bin:/bin",
                "BRIDGE_URL": os.environ.get("BRIDGE_URL",
                    "https://insightly-se-mcp.lukeswade.workers.dev/mcp")}
+        # A packed bundle carries the credential in server/_secret.py; the working tree
+        # does not (public repo), so the suite supplies it the same way an operator would.
+        if BRIDGE_SECRET:
+            env["BRIDGE_SECRET"] = BRIDGE_SECRET
         if with_key:
             env["INSIGHTLY_API_KEY"] = _STORE[TEST_ENV]["api_key"]
             env["INSIGHTLY_POD"] = _STORE[TEST_ENV].get("pod", "na1")
@@ -728,6 +753,157 @@ def part11_create_task() -> None:
     s.close()
 
 
+
+def part12_hardening() -> None:
+    """The endpoint is public and the exports are real data. These are the checks that the
+    ways in are actually closed."""
+    print("\n12. hardening: endpoint gate, signed downloads, snapshots, field basis")
+    base = WORKER_URL.rsplit("/mcp", 1)[0]
+    probe = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+
+    # --- the endpoint is not an open relay -------------------------------------------
+    r = httpx.post(WORKER_URL, json=probe, timeout=30)
+    check("an unauthenticated caller cannot reach the endpoint at all",
+          r.status_code in (401, 429), f"HTTP {r.status_code}")
+    check("the refusal tells the user what to do about it",
+          "reinstall" in r.text.lower() or "too many" in r.text.lower(), r.text[:70])
+    r = httpx.post(WORKER_URL, json=probe, timeout=30,
+                   headers={"X-Bridge-Auth": "not-the-secret"})
+    check("a wrong credential is refused, not merely a missing one",
+          r.status_code in (401, 429), f"HTTP {r.status_code}")
+
+    # Grind on it: the gate must start returning 429 rather than 401 forever.
+    codes = []
+    for _ in range(24):
+        codes.append(httpx.post(WORKER_URL, json=probe, timeout=30,
+                                headers={"X-Bridge-Auth": "wrong"}).status_code)
+    check("repeated failures earn a cooldown instead of unlimited attempts",
+          429 in codes, f"{codes.count(401)}x401 then {codes.count(429)}x429")
+
+    # ...and that cooldown must NOT touch a caller holding the real credential: bad-secret
+    # and bad-key failures are counted separately for exactly this reason.
+    s = Server(capabilities={})
+    who = s.call("connection_info", {})
+    check("a valid credential still works after another IP-mate was blocked",
+          not who.get("error"), f"connected_as={who.get('connected_as')}")
+
+    # --- describe_object states its basis --------------------------------------------
+    d = s.call("describe_object", {"object": "Contacts", "refresh": True})
+    check("describe_object says what its field list rests on",
+          "union of" in str(d.get("basis")), str(d.get("basis"))[:80])
+    check("the field list is a union of several records, not one sample",
+          (d.get("sampled") or 0) >= 2, f"sampled={d.get('sampled')}")
+    check("no field varies across sampled records (Insightly returns a fixed key set)",
+          not d.get("fields_partial"), str(d.get("fields_partial") or "none consistent")[:60])
+    check("custom fields still come from the authoritative endpoint",
+          "/CustomFields/" in str(d.get("custom_fields_basis")), str(d.get("custom_fields_basis")))
+    d2 = s.call("describe_object", {"object": "Contacts"})
+    check("the second describe is served from cache", d2.get("cached") is True,
+          f"cached={d2.get('cached')}")
+    check("cached and live answers agree",
+          d2.get("standard_fields") == d.get("standard_fields"),
+          f"{len(d2.get('standard_fields') or [])} fields both ways")
+
+    # --- exports: signed, expiring, tamper-proof -------------------------------------
+    t = s.call("start_export", {"object": "Tasks", "brief": True})
+    tid = t.get("task_id")
+    for _ in range(60):
+        st = s.call("task_status", {"task_id": tid})
+        if st.get("status") != "working":
+            break
+        time.sleep(1)
+    csv = s.call("export_csv", {"task_id": tid, "ttl_minutes": 30})
+    url = str(csv.get("url") or "")
+    check("the CSV link is served by the worker, not a public bucket",
+          url.startswith(base + "/d/") and "r2.dev" not in url, url[:70])
+    check("the link carries an expiry", bool(csv.get("expires_at")), str(csv.get("expires_at")))
+    got = httpx.get(url, timeout=60, follow_redirects=True)
+    check("the signed link downloads the file",
+          got.status_code == 200 and got.text.startswith("TASK_ID,"),
+          f"HTTP {got.status_code} {got.text[:40]}")
+    bad = httpx.get(url[:-4] + "dead", timeout=30)
+    check("a tampered signature is refused", bad.status_code == 403, f"HTTP {bad.status_code}")
+    swapped = url.replace("/d/" + url.split("/d/")[1].split("/")[0] + "/", "/d/" + "0" * 64 + "/")
+    check("a link cannot be re-pointed at another environment's file",
+          httpx.get(swapped, timeout=30).status_code == 403)
+    if SIGNING_KEY:
+        # Forge a VALID signature over a PAST expiry — only possible because the suite has
+        # the signing key locally. This is the only way to prove the expiry is enforced
+        # rather than merely advertised.
+        tenant, file = url.split("/d/")[1].split("?")[0].split("/", 1)
+        past = int(time.time()) - 60
+        sig = hmac.new(SIGNING_KEY.encode(), f"{tenant}|{file}|{past}".encode(),
+                       hashlib.sha256).hexdigest()[:32]
+        exp = httpx.get(f"{base}/d/{tenant}/{file}?e={past}&t={sig}", timeout=30)
+        check("a correctly-signed but expired link is refused",
+              exp.status_code == 410, f"HTTP {exp.status_code}")
+
+    # --- snapshots outlive the task --------------------------------------------------
+    snaps = s.call("snapshot_list", {})
+    ids = [x.get("snapshot_id") for x in snaps.get("items", [])]
+    check("the completed export was persisted as a snapshot", tid in ids,
+          f"{len(ids)} snapshots, newest={ids[0] if ids else None}")
+    live = s.call("task_query", {"task_id": tid, "group_by": "COMPLETED",
+                                 "metrics": [{"op": "count"}]})
+    snap = s.call("snapshot_query", {"snapshot_id": tid, "group_by": "COMPLETED",
+                                     "metrics": [{"op": "count"}]})
+    check("the snapshot answers identically to the live task (one shared query engine)",
+          snap.get("items") == live.get("items"),
+          f"live={live.get('items')} snapshot={snap.get('items')}")
+    check("the snapshot reports where the answer came from",
+          snap.get("source") == "r2 snapshot" and snap.get("snapshot_id") == tid,
+          str(snap.get("source")))
+    miss = s.call("snapshot_query", {"snapshot_id": "nope" + tid[:4]})
+    check("an unknown snapshot fails clearly instead of silently empty",
+          "no snapshot" in str(miss.get("error")), str(miss.get("error"))[:60])
+    s.close()
+
+    # --- key custody: source assertions, since DO storage is not observable ----------
+    src = open(os.path.join(os.path.dirname(HERE), "worker", "src", "tasks.ts")).read()
+    check("a task that never finishes is expired by wall-clock age",
+          "MAX_WORKING_MS" in src and "age > MAX_WORKING_MS" in src)
+    check("the key is deleted on the timeout path too, not only on clean completion",
+          src.count("delete m.session") >= 2, f"{src.count('delete m.session')} deletion sites")
+    check("the alarm reschedules from `finally`, so a thrown tick cannot orphan a key",
+          "} finally {" in src and "setAlarm" in src.split("} finally {")[1][:600])
+    check("every fetch reaps first, so an untouched DO still cleans up when poked",
+          "await this.reap();" in src)
+
+
+
+def part13_describe_basis() -> None:
+    """describe_object must not infer a field list from one record and stay quiet about it.
+    Blocker-tier findings against other tools have been exactly this: a silently
+    incomplete field list."""
+    print("\n13. describe_object states its basis")
+    s = Server(capabilities={})
+    d = s.call("describe_object", {"object": "Contacts"})
+    check("the field list says what it rests on", "union of" in str(d.get("basis")),
+          str(d.get("basis"))[:80])
+    check("more than one record was sampled", (d.get("sampled") or 0) >= 2,
+          f"sampled={d.get('sampled')}")
+    check("both ends of the object were sampled", "oldest +" in str(d.get("basis")),
+          str(d.get("basis"))[:50])
+    check("no field varies across sampled records (fixed key set, verified 2026-08)",
+          not d.get("fields_partial"), str(d.get("fields_partial") or "consistent")[:60])
+    check("custom fields come from the authoritative endpoint",
+          "/CustomFields/" in str(d.get("custom_fields_basis")),
+          str(d.get("custom_fields_basis")))
+    empty = s.call("describe_object", {"object": "KnowledgeArticle"})
+    check("an object with no records says so instead of returning a bare []",
+          bool(empty.get("basis")) or bool(empty.get("standard_fields")),
+          str(empty.get("basis") or f"{len(empty.get('standard_fields') or [])} fields")[:70])
+    s.close()
+
+    # The two editions are behavioural ports; drift must be a failing build, not a surprise.
+    import subprocess
+    r = subprocess.run([sys.executable,
+                        os.path.join(os.path.dirname(HERE), "tools", "check_parity.py")],
+                       capture_output=True, text=True)
+    check("the worker covers every classic tool, extras all declared",
+          r.returncode == 0, (r.stdout.strip().splitlines() or [""])[-1][:90])
+
+
 def part5_audit() -> None:
     print("\n5. swagger/API-doc audit fixes")
     s = Server(capabilities={})
@@ -807,6 +983,8 @@ def main() -> int:
     part7_payload()
     part8_projection()
     part9_query_engine()
+    part12_hardening()
+    part13_describe_basis()
     part11_create_task()   # mutates Tasks — keep last
 
     failed = [r for r in results if r[0] == FAIL]

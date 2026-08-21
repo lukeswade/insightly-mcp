@@ -42,7 +42,7 @@ from mcp.server.mcpserver import Context  # NOT mcp.server.context — that one 
 
 from app_ui import ENV_DASHBOARD_HTML
 
-SERVER_VERSION = "3.10.0"
+SERVER_VERSION = "3.11.0"
 READONLY = os.environ.get("INSIGHTLY_READONLY", "").lower() in ("1", "true", "yes")
 KEYS_FILE = os.environ.get("INSIGHTLY_KEYS_FILE", os.path.expanduser("~/.insightly-mcp/keys.json"))
 
@@ -733,6 +733,8 @@ def _obj(name: str) -> str:
 # that reason. Anything returned to the user as a final answer gets hydrated back to whole
 # records by _hydrate, because CUSTOMFIELDS is often where the interesting data lives.
 _BRIEF_DROP = frozenset(("body", "details", "customfields", "image_url", "etag"))
+# Records sampled from EACH END of an object to derive its standard field list.
+_DESCRIBE_SAMPLE = 5
 
 def _brief_strip(data: Any) -> Any:
     """Drop heavy fields from each record in a brief list result; pass other shapes through."""
@@ -1908,7 +1910,8 @@ async def _env_snapshot() -> dict:
 @mcp.tool()
 async def describe_object(object: str, ctx: Context) -> Any:
     """Field reference for an object — call this BEFORE creating/updating records you
-    haven't touched yet. Returns `standard_fields` (from a sample record) and compact
+    haven't touched yet. Returns `standard_fields` (the union of a sample of records, with
+    `basis` stating exactly what that sample was) and compact
     `custom_fields` (name, label, type, dropdown options, lookup target) so payloads
     use real field names and valid option values. Custom values go in CUSTOMFIELDS:
     [{"FIELD_NAME": "...__c", "FIELD_VALUE": ...}].
@@ -1922,21 +1925,76 @@ async def describe_object(object: str, ctx: Context) -> Any:
 
 
 async def _describe(o: str) -> dict:
-    """Build the field reference for an object. Shared by the tool and the resource."""
+    """Build the field reference for an object. Shared by the tool and the resource.
+
+    Standard fields are not published by any Insightly metadata endpoint, so they can only
+    be read off actual records. This used to infer them from ONE record — the same silent
+    failure mode we flag in other tools: if the API ever omitted null-valued fields, the
+    list would be quietly short. Verified 2026-08 that every record of an object returns an
+    identical key set (nulls included), but verified is not guaranteed, so this takes the
+    UNION of a sample from both ends of the object, states how many records that was, and
+    names any field that appeared in some records but not all. Custom fields come from
+    /CustomFields/{object}, which IS authoritative.
+    """
     out: dict = {"object": o, "pk": PK.get(o)}
-    sample = await _request("GET", f"/{o}", params={"top": 1, "brief": "false"})
-    if isinstance(sample, list) and sample and isinstance(sample[0], dict):
-        out["standard_fields"] = [k for k in sample[0].keys() if k not in ("CUSTOMFIELDS", "ETag")]
-    elif isinstance(sample, dict) and sample.get("error"):
-        out["standard_fields_error"] = sample["error"]
-    else:
+    body, hdrs = await _request("GET", f"/{o}", params={"top": _DESCRIBE_SAMPLE,
+                                                       "brief": "false",
+                                                       "count_total": "true"},
+                               want_headers=True)
+    sample = [r for r in body if isinstance(r, dict)] if isinstance(body, list) else []
+    oldest, newest = len(sample), 0
+    try:
+        total = int((hdrs or {}).get("x-total-count", ""))
+    except (TypeError, ValueError):
+        total = None
+    if total and total > _DESCRIBE_SAMPLE:
+        # The newest end too: a field added by an admin last week can only show up there.
+        tail = await _request("GET", f"/{o}", params={"top": _DESCRIBE_SAMPLE,
+                                                     "skip": max(total - _DESCRIBE_SAMPLE, 0),
+                                                     "brief": "false"})
+        if isinstance(tail, list):
+            rows = [r for r in tail if isinstance(r, dict)]
+            newest = len(rows)
+            sample += rows
+
+    if isinstance(body, dict) and body.get("error"):
+        out["standard_fields_error"] = body["error"]
+        out["basis"] = "standard fields unavailable — the record read failed"
+    elif not sample:
         out["standard_fields"] = []
-        out["note"] = "no records yet — standard fields unavailable from a sample."
+        out["basis"] = "no records yet — standard fields cannot be read from data"
+        out["note"] = ("create one record, or consult Insightly's API docs, for the "
+                       "standard field list.")
+    else:
+        seen: dict = {}
+        for rec in sample:
+            for k in rec:
+                if k in ("CUSTOMFIELDS", "ETag"):
+                    continue
+                seen[k] = seen.get(k, 0) + 1          # insertion order = API order
+        out["standard_fields"] = list(seen)
+        partial = [k for k, n in seen.items() if n < len(sample)]
+        out["basis"] = (f"union of {len(sample)} records ({oldest} oldest + {newest} newest"
+                        f"{f' of {total}' if total else ''}) — Insightly publishes no "
+                        "standard-field metadata")
+        out["sampled"] = len(sample)
+        if total:
+            out["total_records"] = total
+        if partial:
+            out["fields_partial"] = partial
+            out["warning"] = ("these fields were absent from some sampled records, so this "
+                              "object's field set varies by record and standard_fields may "
+                              "still be incomplete — confirm against a record you care "
+                              "about before relying on it.")
+
     cfs = await _request("GET", f"/CustomFields/{o}")
     if isinstance(cfs, list):
         out["custom_fields"] = [_cf_compact(f) for f in cfs if isinstance(f, dict)]
+        out["custom_fields_basis"] = f"/CustomFields/{o} (authoritative)"
     else:
         out["custom_fields"] = []
+        if isinstance(cfs, dict) and cfs.get("error"):
+            out["custom_fields_error"] = cfs["error"]
     return out
 
 

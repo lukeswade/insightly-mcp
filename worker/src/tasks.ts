@@ -16,11 +16,21 @@
  */
 import { Insightly, PAGE_MAX, PK, briefStrip, fit, pooled, projectAll, rankSort,
          rankTopBy } from "./insightly";
+import { exportKey } from "./links";
+import { makePacer } from "./pacer";
+import { runQuery, writeSnapshot } from "./snapshots";
 import { GroupState, Metric, TopN, WhereClause, accumulate, finishGroups, getField,
          matches, referencedFields, sortByField } from "./query";
 
 const TASK_POLL_MS = 500;
 const TASK_TTL_MS = 3600_000;
+/**
+ * A task that never reaches a terminal state used to keep its API key in DO storage with
+ * nothing left to reap it — the sweep only looked at done_at. Any job still "working"
+ * past this wall-clock age is declared dead and cleaned up, key included. Generous enough
+ * that a real 250k-record export finishes inside it.
+ */
+const MAX_WORKING_MS = 20 * 60_000;
 const EXPORT_SAFETY_CAP = 250_000;
 const CHUNK_BYTES = 700_000;
 const ROUNDS_PER_TICK = 6;         // waves of parallel pages per alarm
@@ -37,6 +47,8 @@ interface Meta {
   cancel: boolean; chunks: number; count: number;
   chunk_rows: number[];
   params: any;
+  tenant?: string;                          // hash of (key, pod) — never the key itself
+  snapshot?: boolean;                       // rows also persisted to R2
   session?: { key: string; pod: string };   // present ONLY while status === "working"
 }
 
@@ -49,6 +61,11 @@ function pub(m: Meta, includeResult = false): Record<string, any> {
   };
   if (m.error) out.error = m.error;
   if (m.summary) out.summary = m.summary;
+  // The snapshot outlives this task by a week — say so, or nobody knows to ask for it.
+  if (m.snapshot) {
+    out.snapshot_id = m.task_id;
+    out.snapshot_note = "queryable for 7 days via snapshot_query, after this task expires.";
+  }
   if (includeResult && m.status !== "working") out.result_count = m.count;
   return out;
 }
@@ -79,6 +96,58 @@ export class TaskDO {
     m.done_at = now();
     delete m.session;                               // the key leaves storage immediately
     await this.putMeta(m);
+    if (status === "completed" && m.kind === "export" && m.count > 0) {
+      // Keep the expensive part. The DO sweeps in an hour; the snapshot answers follow-up
+      // questions for a week, including from a brand new chat.
+      try {
+        await this.persist(m);
+        m.snapshot = true;
+        await this.putMeta(m);
+      } catch (e) {
+        console.error("[snapshot]", String(e).slice(0, 200));
+      }
+    }
+  }
+
+  /** Stream this task's stored chunks into an R2 snapshot. */
+  private async persist(m: Meta): Promise<void> {
+    if (!this.env?.EXPORTS || !m.tenant) return;
+    const chunks = m.chunks, storage = this.state.storage, tid = m.task_id;
+    async function* rows(): AsyncIterable<any[]> {
+      for (let c = 0; c < chunks; c++) {
+        yield (await storage.get<any[]>(`chunk:${tid}:${c}`)) ?? [];
+      }
+    }
+    await writeSnapshot(this.env, m.tenant, m.task_id, {
+      object: String(m.params?.o ?? ""), rows: String(m.count),
+      detail: String(m.detail ?? ""), captured_at: m.done_at ?? now(),
+    }, rows());
+  }
+
+  /**
+   * Expire anything stuck, and never leave a key sitting behind a broken alarm chain.
+   * Called from the alarm AND from every fetch, so a DO nobody is polling still cleans up
+   * the moment anyone touches it.
+   */
+  private async reap(): Promise<{ working: number; retained: number }> {
+    const metas = await this.state.storage.list<Meta>({ prefix: "meta:" });
+    let working = 0, retained = 0;
+    for (const m of metas.values()) {
+      const age = Date.now() - Date.parse(m.created_at);
+      if (m.status === "working" && age > MAX_WORKING_MS) {
+        m.error = `abandoned after ${Math.round(age / 60000)} minutes without finishing`;
+        await this.finish(m, "failed", "timed out — no progress within the maximum run time");
+      } else if (m.status !== "working" && m.session) {
+        delete m.session;                     // belt and braces: a key outliving its task
+        await this.putMeta(m);
+      }
+      if (m.status === "working") working++;
+      else if (m.done_at && Date.parse(m.done_at) < Date.now() - TASK_TTL_MS) {
+        for (let c = 0; c < m.chunks; c++) await this.state.storage.delete(`chunk:${m.task_id}:${c}`);
+        await this.state.storage.delete(`meta:${m.task_id}`);
+      } else if (m.done_at) retained++;       // still inside its TTL — the sweep must return
+    }
+    return { working, retained };
   }
 
   /** Append rows as byte-bounded chunks. */
@@ -112,6 +181,9 @@ export class TaskDO {
     const body: any = await request.json();
     const op = body.op as string;
     const respond = (x: unknown) => Response.json(x as any);
+    // Cheap on an idle DO, and it means a stuck task cannot hold a key just because
+    // nothing rescheduled the alarm.
+    if (op !== "status") await this.reap();
 
     if (op === "start_export" || op === "start_bulk" || op === "start_aggregate"
         || op === "start_rank") {
@@ -124,6 +196,7 @@ export class TaskDO {
         created_at: now(), last_updated_at: now(), done_at: null,
         progress: 0, total: null, error: null, summary: null,
         cancel: false, chunks: 0, count: 0, chunk_rows: [], params: body.params,
+        tenant: body.tenant,
         session: body.session,
       };
       if (op === "start_bulk") {
@@ -181,51 +254,13 @@ export class TaskDO {
 
     if (op === "query") {
       const m = await this.meta(body.task_id);
-      if (!m) return respond({ error: `unknown task_id '${body.task_id}'.` });
+      if (!m) return respond({ error: `unknown task_id '${body.task_id}'.`, expired: true });
       if (m.status === "working") {
         return respond({ error: `the export is still running — status '${m.status}', ` +
                                 `progress ${m.progress}. Query it when completed.` });
       }
-      const where: WhereClause[] | undefined = body.where;
-      const metrics: Metric[] = body.metrics ?? [];
-      const groupBy: string | undefined = body.group_by;
-      const fields: string[] | undefined = body.fields?.length ? body.fields : undefined;
-      const top = Math.min(Math.max(Math.trunc(body.top ?? 100), 1), QUERY_TOP_CAP);
-
-      if (groupBy !== undefined || metrics.length) {
-        const state: GroupState = {};
-        let matched = 0;
-        await this.scan(m, (rec) => {
-          if (!matches(rec, where)) return;
-          matched++;
-          accumulate(state, rec, groupBy, metrics.length ? metrics : [{ op: "count" }]);
-        });
-        const rows = finishGroups(state, groupBy, metrics.length ? metrics : [{ op: "count" }]);
-        return respond(fit(rows.slice(0, top), {
-          matched, scanned: m.count, groups: rows.length,
-          group_by: groupBy ?? null, source_task: m.task_id }));
-      }
-
-      let matched = 0;
-      let rows: any[];
-      if (body.order_by) {
-        const topn = new TopN(body.order_by, top);
-        await this.scan(m, (rec) => { if (matches(rec, where)) { matched++; topn.push(rec); } });
-        rows = topn.result();
-      } else {
-        rows = [];
-        await this.scan(m, (rec) => {
-          if (!matches(rec, where)) return;
-          matched++;
-          if (rows.length < top) rows.push(rec);
-        });
-      }
-      const o = String(m.params?.o ?? "");
-      if (fields) rows = projectAll(rows, fields, o);
-      return respond(fit(rows, { matched, scanned: m.count, returned: rows.length,
-        order_by: body.order_by ?? null, source_task: m.task_id,
-        note: matched > rows.length ? `showing ${rows.length} of ${matched} matches — ` +
-          "narrow with `where`, or raise `top` (cap 500)." : undefined }));
+      return respond(await runQuery((visit) => this.scan(m, visit), body, m.count,
+        String(m.params?.o ?? ""), { source_task: m.task_id }));
     }
 
     if (op === "csv") {
@@ -254,7 +289,7 @@ export class TaskDO {
         lines.push(cols.map((c) => csvEscape(getField(rec, c))).join(","));
       });
       const csv = lines.join("\r\n");
-      const key = `exports/${m.task_id}-${crypto.randomUUID().replace(/-/g, "")}.csv`;
+      const key = exportKey(m.tenant ?? "unknown", m.task_id);
       await this.env.EXPORTS.put(key, csv, {
         httpMetadata: { contentType: "text/csv",
                         contentDisposition: `attachment; filename="${m.detail || "export"}-${m.task_id}.csv"` } });
@@ -282,31 +317,33 @@ export class TaskDO {
   }
 
   async alarm(): Promise<void> {
-    const metas = await this.state.storage.list<Meta>({ prefix: "meta:" });
-    let anyWorking = false;
-    for (const m of metas.values()) {
-      if (m.status === "working") {
+    try {
+      const metas = await this.state.storage.list<Meta>({ prefix: "meta:" });
+      for (const m of metas.values()) {
+        if (m.status !== "working") continue;
+        if (Date.now() - Date.parse(m.created_at) > MAX_WORKING_MS) continue;  // reap expires it
         try {
           await this.tick(m);
         } catch (e) {
           m.error = String(e).slice(0, 300);
           await this.finish(m, "failed", "unexpected error — see error field");
         }
-        if (m.status === "working") anyWorking = true;
-      } else if (m.done_at && Date.parse(m.done_at) < Date.now() - TASK_TTL_MS) {
-        for (let c = 0; c < m.chunks; c++) await this.state.storage.delete(`chunk:${m.task_id}:${c}`);
-        await this.state.storage.delete(`meta:${m.task_id}`);
       }
-    }
-    if (anyWorking) await this.state.storage.setAlarm(Date.now() + 1000);
-    else if ([...metas.values()].some((m) => m.done_at)) {
-      await this.state.storage.setAlarm(Date.now() + TASK_TTL_MS + 5000);   // the sweep
+    } finally {
+      // In `finally` on purpose: if a tick throws in a way the inner catch cannot handle,
+      // the chain must still be rescheduled, or a working task keeps its key forever with
+      // nothing coming back to reap it.
+      const { working, retained } = await this.reap();
+      if (working) await this.state.storage.setAlarm(Date.now() + 1000);
+      else if (retained) await this.state.storage.setAlarm(Date.now() + TASK_TTL_MS + 5000);
     }
   }
 
   private async tick(m: Meta): Promise<void> {
     if (!m.session) { await this.finish(m, "failed", "session lost"); return; }
-    const ins = new Insightly({ key: m.session.key, pod: m.session.pod });
+    const tenant = m.tenant;
+    const ins = new Insightly({ key: m.session.key, pod: m.session.pod },
+      tenant ? makePacer(this.env, async () => tenant) : undefined);
 
     if (m.kind === "export" || m.kind === "aggregate") {
       const { o, brief, updatedAfterUtc, cap } = m.params;
@@ -461,7 +498,7 @@ export async function taskCall(env: any, session: { key: string; pod: string },
   const stub = env.TASKS.get(env.TASKS.idFromName(name));
   const r = await stub.fetch("https://task-do/", {
     method: "POST",
-    body: JSON.stringify({ ...payload, session }),
+    body: JSON.stringify({ ...payload, session, tenant: name }),
     headers: { "Content-Type": "application/json" },
   });
   return await r.json();

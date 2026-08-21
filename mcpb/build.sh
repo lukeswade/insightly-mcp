@@ -19,6 +19,9 @@ if [ "$VER" != "$MVER" ]; then
 fi
 echo "Version: $VER"
 
+# Edition drift is a failing build, not a discovery six weeks later.
+python3 "$HERE/../tools/check_parity.py"
+
 # Keep a single source of truth: copy the canonical server (and its UI module — the
 # server imports app_ui, so omitting it makes the bundle die on import) into the bundle.
 mkdir -p "$HERE/server" "$ROOT/dist"
